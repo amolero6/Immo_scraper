@@ -75,14 +75,21 @@ def format_new_property_message(prop: dict) -> str:
     pool_emoji = "🏊" if prop.get("has_pool") else ""
     ac_emoji = "❄️" if prop.get("has_ac") else ""
     extras = " ".join(filter(None, [pool_emoji, ac_emoji]))
+    similarity_score = prop.get("similarity_score")
+    similarity_profile = prop.get("similarity_profile")
+    similarity_line = ""
+    if similarity_score is not None:
+        profile_text = f" · {similarity_profile}" if similarity_profile else ""
+        similarity_line = f"\n🎯 Similitud: *{similarity_score}/100*{profile_text}"
 
     return (
         f"🏠 *Nova propietat detectada* {extras}\n\n"
         f"*{_escape(prop.get('title', 'Sense títol'))}*\n"
-        f"💰 Preu: *{prop.get('price', '?'):,} €*\n"
+        f"💰 Preu: *{_format_price(prop.get('price'))} €*\n"
         f"🛏 Habitacions: {prop.get('rooms', '?')}\n"
         f"🚿 Banys: {prop.get('bathrooms', '?')}\n"
         f"📐 Superfície: {prop.get('sqm', '?')} m²\n"
+        f"{similarity_line}"
         f"🔗 [Veure anunci]({prop.get('url', '')})"
     )
 
@@ -101,15 +108,22 @@ def format_price_drop_message(prop: dict, old_price: int) -> str:
     new_price = prop.get("price", 0)
     drop = old_price - new_price
     pct = (drop / old_price * 100) if old_price else 0
+    similarity_score = prop.get("similarity_score")
+    similarity_profile = prop.get("similarity_profile")
+    similarity_line = ""
+    if similarity_score is not None:
+        profile_text = f" · {similarity_profile}" if similarity_profile else ""
+        similarity_line = f"\n🎯 Similitud: *{similarity_score}/100*{profile_text}"
 
     return (
         f"📉 *Baixada de preu detectada!*\n\n"
         f"*{_escape(prop.get('title', 'Sense títol'))}*\n"
-        f"💰 Preu antic: ~~{old_price:,} €~~\n"
-        f"💰 Preu nou:  *{new_price:,} €*\n"
-        f"📉 Baixada: -{drop:,} € ({pct:.1f}%)\n"
+        f"💰 Preu antic: ~~{_format_price(old_price)} €~~\n"
+        f"💰 Preu nou:  *{_format_price(new_price)} €*\n"
+        f"📉 Baixada: -{_format_price(drop)} € ({pct:.1f}%)\n"
         f"🛏 Habitacions: {prop.get('rooms', '?')}\n"
         f"🚿 Banys: {prop.get('bathrooms', '?')}\n"
+        f"{similarity_line}"
         f"🔗 [Veure anunci]({prop.get('url', '')})"
     )
 
@@ -124,3 +138,16 @@ def _escape(text: str) -> str:
     for char in ("_", "*", "`", "["):
         text = text.replace(char, f"\\{char}")
     return text
+
+
+def _format_price(value: object) -> str:
+    if value is None:
+        return "?"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if numeric.is_integer():
+        return f"{int(numeric):,}"
+    return f"{numeric:,.2f}".rstrip("0").rstrip(".")

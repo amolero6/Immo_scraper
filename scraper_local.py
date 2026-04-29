@@ -11,6 +11,7 @@ Dependencies:
   pip install playwright
   playwright install chromium
 """
+from __future__ import annotations
 
 import logging
 import re
@@ -27,18 +28,20 @@ logger = logging.getLogger(__name__)
 SCRAPERS: List[Dict] = [
     {
         "source": "amat",
-        "base_url": "https://www.amat.es/ca/compra/habitatge?q=Sant+Cugat+del+Vall%C3%A8s",
-        # CSS selectors – fill in the real ones after inspecting the page
-        "listing_selector": "article.property-card",          # TODO: adjust
-        "title_selector": "h2.property-title",                # TODO: adjust
-        "price_selector": "span.price",                       # TODO: adjust
-        "link_selector": "a.property-link",                   # TODO: adjust
-        "rooms_selector": "span.rooms",                       # TODO: adjust
-        "bathrooms_selector": "span.bathrooms",               # TODO: adjust
-        "sqm_selector": "span.sqm",                           # TODO: adjust
+        "base_url": "https://www.amatimmobiliaris.com/ca/immobles-en-venda?town=SANT+CUGAT+DEL+VALLES",
+        "city": "Sant Cugat del Vallès",
+        # CSS selectors adapted to the real Amat listing cards.
+        # The card is a Bootstrap panel and some fields are plain text inside blocks.
+        "listing_selector": "div.panel.panel-default",
+        "title_selector": "h3.title-product-container",
+        "price_selector": "div.price-name-container span",
+        "link_selector": "a[href*='/ca/venda/']",
+        "rooms_selector": "div.habitaciones",
+        "bathrooms_selector": "div.banos",
+        "sqm_selector": "div.superficie",
         "pool_keyword": "piscina",                            # case-insensitive
         "ac_keyword": "aire condicionat",                     # case-insensitive
-        "next_page_selector": "a[rel='next']",                # TODO: adjust
+        "next_page_selector": "a[rel='next']",
         "max_pages": 10,
     },
     # Add more agencies here following the same shape
@@ -195,6 +198,21 @@ def _extract_property(card, cfg: Dict) -> Dict | None:
             "has_pool": has_pool,
             "has_ac": has_ac,
             "orientation": None,  # Not typically available in listings
+            "property_type": cfg.get("property_type"),
+            "operation": cfg.get("operation"),
+            "city": cfg.get("city"),
+            "district": cfg.get("district"),
+            "neighborhood": cfg.get("neighborhood"),
+            "postal_code": cfg.get("postal_code"),
+            "latitude": cfg.get("latitude"),
+            "longitude": cfg.get("longitude"),
+            "energy_rating": cfg.get("energy_rating"),
+            "year_built": cfg.get("year_built"),
+            "floor": cfg.get("floor"),
+            "terrace": int(bool(cfg.get("terrace", False))),
+            "elevator": int(bool(cfg.get("elevator", False))),
+            "parking": int(bool(cfg.get("parking", False))),
+            "is_favourite": int(bool(cfg.get("is_favourite", False))),
         }
     except Exception as exc:
         logger.warning("Could not parse a property card: %s", exc)
@@ -202,9 +220,20 @@ def _extract_property(card, cfg: Dict) -> Dict | None:
 
 
 def _parse_price(text: str) -> int | None:
-    """Extract an integer price from a string like '450.000 €' or '€ 450,000'."""
-    digits = re.sub(r"[^\d]", "", text)
-    return int(digits) if digits else None
+    """Extract a numeric price from a string like '450.000 €' or '€ 450,000'."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    cleaned = cleaned.replace("€", "").replace(" ", "")
+    cleaned = cleaned.replace(".", "").replace(",", ".")
+    cleaned = re.sub(r"[^\d.]", "", cleaned)
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        digits = re.sub(r"[^\d]", "", text)
+        return float(digits) if digits else None
 
 
 def _parse_int(text: str) -> int | None:

@@ -11,6 +11,7 @@ Run manually or via cron:
 Environment variables (see .env.example):
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, APIFY_API_TOKEN
 """
+from __future__ import annotations
 
 import logging
 import os
@@ -28,6 +29,8 @@ from database import init_db, upsert_property, mark_inactive, get_property, get_
 from telegram_bot import send_alert, format_new_property_message, format_price_drop_message
 from scraper_local import scrape_all_local
 from scraper_apify import scrape_idealista
+from matching import best_similarity_match
+from similarity_config import FAVORITE_PROFILES, MIN_SIMILARITY_SCORE, ALERT_LOCATION_TERMS
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -50,6 +53,7 @@ logger = logging.getLogger(__name__)
 MAX_PRICE: int = 700_000      # €
 MIN_ROOMS: int = 3
 MIN_BATHROOMS: int = 2
+MIN_SIMILARITY_SCORE_ALERT: int = MIN_SIMILARITY_SCORE
 
 # ---------------------------------------------------------------------------
 # Feature flags (set to False to disable individual scrapers)
@@ -117,6 +121,10 @@ def run() -> None:
             logger.warning("Property without ID encountered – skipping: %s", prop)
             continue
 
+        similarity = best_similarity_match(prop, FAVORITE_PROFILES)
+        prop["similarity_score"] = similarity["similarity_score"]
+        prop["similarity_profile"] = similarity["similarity_profile"]
+
         # Snapshot of the current DB state before upsert
         existing = get_property(pid)
 
@@ -153,13 +161,13 @@ def run() -> None:
     alerts_sent = 0
 
     for prop in new_properties:
-        if _matches_criteria(prop, avg_price):
+        if _matches_criteria(prop, avg_price, MIN_SIMILARITY_SCORE_ALERT):
             msg = format_new_property_message(prop)
             if send_alert(msg):
                 alerts_sent += 1
 
     for prop, old_price in price_drops:
-        if _matches_criteria(prop, avg_price):
+        if _matches_criteria(prop, avg_price, MIN_SIMILARITY_SCORE_ALERT):
             msg = format_price_drop_message(prop, old_price)
             if send_alert(msg):
                 alerts_sent += 1
@@ -177,17 +185,24 @@ def run() -> None:
 # Filtering helper
 # ---------------------------------------------------------------------------
 
-def _matches_criteria(prop: Dict, avg_price: float | None = None) -> bool:
+def _matches_criteria(
+    prop: Dict,
+    avg_price: float | None = None,
+    min_similarity_score: int = 0,
+) -> bool:
     """
     Return True if *prop* satisfies the monitoring criteria:
       - price < MAX_PRICE
       - rooms >= MIN_ROOMS
       - bathrooms >= MIN_BATHROOMS
+      - similarity score >= min_similarity_score
+      - location must mention one of the configured alert terms
       - (optional) price below market average
     """
     price = prop.get("price")
     rooms = prop.get("rooms")
     bathrooms = prop.get("bathrooms")
+    similarity_score = prop.get("similarity_score") or 0
 
     if price is None or rooms is None or bathrooms is None:
         return False
@@ -197,6 +212,22 @@ def _matches_criteria(prop: Dict, avg_price: float | None = None) -> bool:
     if rooms < MIN_ROOMS:
         return False
     if bathrooms < MIN_BATHROOMS:
+        return False
+    if similarity_score < min_similarity_score:
+        logger.debug(
+            "Property '%s' excluded: similarity %s < min %s",
+            prop.get("property_id"),
+            similarity_score,
+            min_similarity_score,
+        )
+        return False
+    if ALERT_LOCATION_TERMS and _has_location_hints(prop) and not _matches_location(
+        prop, ALERT_LOCATION_TERMS
+    ):
+        logger.debug(
+            "Property '%s' excluded: no alert location terms matched",
+            prop.get("property_id"),
+        )
         return False
 
     # Bonus filter: alert only if price is below the market average (if known)
@@ -210,6 +241,40 @@ def _matches_criteria(prop: Dict, avg_price: float | None = None) -> bool:
         return False
 
     return True
+
+
+def _matches_location(prop: Dict, location_terms: List[str]) -> bool:
+    haystack = _normalize_text(
+        " ".join(
+            str(value)
+            for value in [
+                prop.get("title", ""),
+                prop.get("city", ""),
+                prop.get("district", ""),
+                prop.get("neighborhood", ""),
+                prop.get("postal_code", ""),
+                prop.get("url", ""),
+                prop.get("orientation", ""),
+            ]
+            if value
+        )
+    )
+    return any(_normalize_text(term) in haystack for term in location_terms if term)
+
+
+def _has_location_hints(prop: Dict) -> bool:
+    return any(
+        prop.get(field)
+        for field in ("city", "district", "neighborhood", "postal_code", "latitude", "longitude")
+    )
+
+
+def _normalize_text(text: str) -> str:
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    return " ".join(normalized.lower().split())
 
 
 # ---------------------------------------------------------------------------

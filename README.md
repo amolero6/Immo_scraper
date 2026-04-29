@@ -143,10 +143,35 @@ ENABLE_APIFY_SCRAPER=true
 2. Go to **Settings → Integrations → API tokens**.
 3. Click **+ Create new token**, copy it, and paste it into `APIFY_API_TOKEN`.
 
-The scraper uses the community actor **`canadesk/idealista-scraper`**.
-You can swap it for any other Idealista actor by changing `IDEALISTA_ACTOR_ID`
-in `scraper_apify.py`. Check the actor's page on Apify Console for supported
-input fields.
+For a low-volume daily check, the best low-cost option I found is
+**`dz_omar/idealista-scraper-api`**. It is pay-per-event, appears active, and
+is priced around **$0.50 per 1,000 results**, which makes it a better fit than
+the older monthly-priced Idealista actors for a once-per-day run.
+
+If you prefer a more productized scraper with a polished UI and more filters,
+**`sian.agency/smart-idealista-scraper`** is another active option, but it is
+usually more expensive per property.
+
+Update `IDEALISTA_ACTOR_ID` in `scraper_apify.py` if you want to switch the
+code to one of these actors, and verify the actor input schema in Apify
+Console before running it.
+
+### Favorite profiles and similarity scoring
+
+You can define a list of favorite or ideal properties in [similarity_config.py](similarity_config.py).
+Each profile is a structured reference listing with as many fields as you know
+about it. Missing values are allowed and are ignored by the matcher.
+
+The pipeline compares every scraped listing against those favorite profiles and
+stores only the best current similarity score in the database. There is no
+history table for the score itself; if you update your reference profiles, run
+[recalculate_similarity.py](recalculate_similarity.py) to refresh the current
+scores.
+
+Telegram alerts are gated by the price filters, the minimum similarity score,
+and the configured location terms. The similarity model also considers location
+and any extra property attributes you provide, such as property type, rooms,
+bathrooms, sqm, pool, AC, and geo coordinates.
 
 ---
 
@@ -197,6 +222,27 @@ SCRAPERS: List[Dict] = [
    document.querySelectorAll("article.property-card")
    ```
 5. Confirm the selector returns the expected elements, then copy it into `SCRAPERS`.
+
+### Smoke test a new portal
+
+Once the selectors are in place, run the smoke test script against the live site
+to check that extraction and database insertion work end-to-end:
+
+```bash
+LOCAL_SCRAPER_SOURCE=amat python tests/smoke_local_scraper.py
+```
+
+The script prints a sample of the extracted rows, shows field coverage, and
+optionally writes the results into a temporary SQLite database. To test a new
+portal such as Qgat Homes, add a new entry to `SCRAPERS` in [scraper_local.py](scraper_local.py)
+with a unique `source` key and run the same command with that source name:
+
+```bash
+LOCAL_SCRAPER_SOURCE=qgat_homes python tests/smoke_local_scraper.py
+```
+
+If the script reports missing required fields, the selectors or the portal
+mapping still need work.
 
 ---
 
@@ -274,6 +320,9 @@ Alerts are triggered by two events:
 | `telegram_bot.py` | Sends Markdown-formatted messages to a Telegram chat via the Bot API. |
 | `scraper_local.py` | Playwright headless scraper for local agency websites. Configurable per agency via `SCRAPERS`. |
 | `scraper_apify.py` | Calls an Apify actor to scrape Idealista. Normalises raw actor output to the DB schema. |
+| `matching.py` | Computes the similarity score against the configured ideal property profiles. |
+| `similarity_config.py` | User-editable list of ideal property profiles and alert threshold. |
+| `recalculate_similarity.py` | Recomputes the current similarity score for all stored properties. |
 | `requirements.txt` | Python dependencies. |
 | `.env.example` | Template for secrets – copy to `.env` and fill in. |
 
@@ -298,6 +347,23 @@ The SQLite database is stored in `immo_scraper.db` next to `main.py`.
 | `has_pool` | INTEGER | `1` = yes, `0` = no |
 | `has_ac` | INTEGER | `1` = yes, `0` = no |
 | `orientation` | TEXT | e.g. `Sud`, `Est` |
+| `property_type` | TEXT | `flat`, `house`, `duplex`, ... |
+| `operation` | TEXT | `sale`, `rent`, ... |
+| `city` | TEXT | City or municipality |
+| `district` | TEXT | District or area |
+| `neighborhood` | TEXT | Neighborhood or zone |
+| `postal_code` | TEXT | Postal code |
+| `latitude` | REAL | Geo coordinate, if available |
+| `longitude` | REAL | Geo coordinate, if available |
+| `energy_rating` | TEXT | Energy label, if available |
+| `year_built` | INTEGER | Construction year, if available |
+| `floor` | TEXT | Floor or level, if available |
+| `terrace` | INTEGER | `1` = yes, `0` = no |
+| `elevator` | INTEGER | `1` = yes, `0` = no |
+| `parking` | INTEGER | `1` = yes, `0` = no |
+| `is_favourite` | INTEGER | Optional manual marker for curated reference rows |
+| `similarity_score` | INTEGER | Best score vs. configured ideal profiles, from 0 to 100 |
+| `similarity_profile` | TEXT | Name of the ideal profile that produced the best score |
 | `first_seen` | TEXT | ISO-8601 UTC datetime |
 | `last_seen` | TEXT | ISO-8601 UTC datetime |
 | `status` | TEXT | `active` or `inactive` |
