@@ -159,7 +159,7 @@ def run() -> None:
                 alerts_sent += 1
 
     for prop, old_price in price_drops:
-        if _matches_criteria(prop):
+        if _matches_criteria(prop, avg_price):
             msg = format_price_drop_message(prop, old_price)
             if send_alert(msg):
                 alerts_sent += 1
