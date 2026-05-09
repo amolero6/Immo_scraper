@@ -59,8 +59,8 @@ MIN_SIMILARITY_SCORE_ALERT: int = MIN_SIMILARITY_SCORE
 # Feature flags (set to False to disable individual scrapers)
 # ---------------------------------------------------------------------------
 
-ENABLE_LOCAL_SCRAPER: bool = os.getenv("ENABLE_LOCAL_SCRAPER", "true").lower() == "true"
-ENABLE_APIFY_SCRAPER: bool = os.getenv("ENABLE_APIFY_SCRAPER", "true").lower() == "true"
+ENABLE_LOCAL_SCRAPER: bool = True
+ENABLE_APIFY_SCRAPER: bool = False
 
 
 # ---------------------------------------------------------------------------

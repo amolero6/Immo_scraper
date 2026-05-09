@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS properties (
     title        TEXT,
     url          TEXT,
     price        REAL,
+    price_first_seen REAL,
     rooms        INTEGER,
     bathrooms    INTEGER,
     sqm          INTEGER,
@@ -111,6 +112,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
     with _get_conn() as conn:
         conn.executescript(_DDL)
         _ensure_columns(conn)
+        _ensure_price_first_seen(conn)
     logger.info("Database ready.")
 
 
@@ -136,7 +138,7 @@ def upsert_property(prop: Dict) -> str:
 
     with _get_conn() as conn:
         existing = conn.execute(
-            "SELECT price, status FROM properties WHERE property_id = ?",
+            "SELECT price, price_first_seen, status FROM properties WHERE property_id = ?",
             (property_id,),
         ).fetchone()
 
@@ -146,19 +148,20 @@ def upsert_property(prop: Dict) -> str:
                 """
                 INSERT INTO properties
                     (property_id, source, title, url, price, rooms, bathrooms,
-                     sqm, has_pool, has_ac, orientation, property_type, operation,
-                     city, district, neighborhood, postal_code, latitude, longitude,
-                     energy_rating, year_built, floor, terrace, elevator, parking,
-                     is_favourite, similarity_score, similarity_profile, first_seen,
-                     last_seen, status)
+                     price_first_seen, sqm, has_pool, has_ac, orientation,
+                     property_type, operation, city, district, neighborhood,
+                     postal_code, latitude, longitude, energy_rating, year_built,
+                     floor, terrace, elevator, parking, is_favourite,
+                     similarity_score, similarity_profile, first_seen, last_seen,
+                     status)
                 VALUES
                     (:property_id, :source, :title, :url, :price, :rooms, :bathrooms,
-                     :sqm, :has_pool, :has_ac, :orientation, :property_type,
-                     :operation, :city, :district, :neighborhood, :postal_code,
-                     :latitude, :longitude, :energy_rating, :year_built, :floor,
-                     :terrace, :elevator, :parking, :is_favourite,
-                     :similarity_score, :similarity_profile, :first_seen,
-                     :last_seen, 'active')
+                     :price_first_seen, :sqm, :has_pool, :has_ac, :orientation,
+                     :property_type, :operation, :city, :district, :neighborhood,
+                     :postal_code, :latitude, :longitude, :energy_rating,
+                     :year_built, :floor, :terrace, :elevator, :parking,
+                     :is_favourite, :similarity_score, :similarity_profile,
+                     :first_seen, :last_seen, 'active')
                 """,
                 {
                     "property_id": property_id,
@@ -166,6 +169,7 @@ def upsert_property(prop: Dict) -> str:
                     "title": prop.get("title"),
                     "url": prop.get("url"),
                     "price": prop.get("price"),
+                    "price_first_seen": prop.get("price"),
                     "rooms": prop.get("rooms"),
                     "bathrooms": prop.get("bathrooms"),
                     "sqm": prop.get("sqm"),
@@ -233,6 +237,7 @@ def upsert_property(prop: Dict) -> str:
                 is_favourite = :is_favourite,
                 similarity_score = :similarity_score,
                 similarity_profile = :similarity_profile,
+                price_first_seen = COALESCE(price_first_seen, :price_first_seen),
                 last_seen   = :last_seen,
                 status      = 'active'
             WHERE property_id = :property_id
@@ -243,6 +248,7 @@ def upsert_property(prop: Dict) -> str:
                 "title": prop.get("title"),
                 "url": prop.get("url"),
                 "price": new_price,
+                "price_first_seen": new_price,
                 "rooms": prop.get("rooms"),
                 "bathrooms": prop.get("bathrooms"),
                 "sqm": prop.get("sqm"),
@@ -376,6 +382,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         row[1] for row in conn.execute("PRAGMA table_info(properties)").fetchall()
     }
     column_statements = {
+        "price_first_seen": "ALTER TABLE properties ADD COLUMN price_first_seen REAL",
         "property_type": "ALTER TABLE properties ADD COLUMN property_type TEXT",
         "operation": "ALTER TABLE properties ADD COLUMN operation TEXT",
         "city": "ALTER TABLE properties ADD COLUMN city TEXT",
@@ -398,3 +405,33 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     for column_name, statement in column_statements.items():
         if column_name not in existing_columns:
             conn.execute(statement)
+
+
+def _ensure_price_first_seen(conn: sqlite3.Connection) -> None:
+    """Backfill price_first_seen for rows created before the column existed."""
+    conn.execute(
+        """
+        UPDATE properties
+        SET price_first_seen = (
+            SELECT ph.price
+            FROM price_history ph
+            WHERE ph.property_id = properties.property_id
+            ORDER BY ph.date ASC, ph.id ASC
+            LIMIT 1
+        )
+        WHERE price_first_seen IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM price_history ph
+              WHERE ph.property_id = properties.property_id
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE properties
+        SET price_first_seen = price
+        WHERE price_first_seen IS NULL
+          AND price IS NOT NULL
+        """
+    )

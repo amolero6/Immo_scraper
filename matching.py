@@ -90,7 +90,6 @@ def score_against_profile(prop: Dict, profile: Dict) -> Dict:
     score_parts.append(
         (
             "bathrooms",
-                from __future__ import annotations
             _score_numeric(
                 prop.get("bathrooms"),
                 profile.get("target_bathrooms"),

@@ -1,0 +1,41 @@
+table_name,create_sql
+price_history,"CREATE TABLE price_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id TEXT NOT NULL REFERENCES properties(property_id),
+    price       REAL NOT NULL,
+    date        TEXT NOT NULL         -- ISO-8601 datetime
+)"
+properties,"CREATE TABLE properties (
+    property_id  TEXT PRIMARY KEY,
+    source       TEXT NOT NULL,
+    title        TEXT,
+    url          TEXT,
+    price        REAL,
+    rooms        INTEGER,
+    bathrooms    INTEGER,
+    sqm          INTEGER,
+    has_pool     INTEGER DEFAULT 0,   -- 0/1 (SQLite has no BOOLEAN)
+    has_ac       INTEGER DEFAULT 0,
+    orientation  TEXT,
+    property_type TEXT,
+    operation    TEXT,
+    city         TEXT,
+    district     TEXT,
+    neighborhood TEXT,
+    postal_code  TEXT,
+    latitude     REAL,
+    longitude    REAL,
+    energy_rating TEXT,
+    year_built   INTEGER,
+    floor        TEXT,
+    terrace      INTEGER DEFAULT 0,
+    elevator     INTEGER DEFAULT 0,
+    parking      INTEGER DEFAULT 0,
+    is_favourite INTEGER DEFAULT 0,
+    similarity_score INTEGER,
+    similarity_profile TEXT,
+    first_seen   TEXT NOT NULL,       -- ISO-8601 datetime
+    last_seen    TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'active'
+)"
+sqlite_sequence,"CREATE TABLE sqlite_sequence(name,seq)"

@@ -197,6 +197,7 @@ SCRAPERS: List[Dict] = [
         "rooms_selector":   "span.rooms",              # e.g. "4 hab."
         "bathrooms_selector": "span.bathrooms",        # e.g. "2 baños"
         "sqm_selector":     "span.sqm",                # e.g. "120 m²"
+      "pagination_page_selector": "ul.pagination a[href^='#page-']",  # optional: detect last page from links
         "pool_keyword":     "piscina",                 # text to detect pool
         "ac_keyword":       "aire condicionat",        # text to detect A/C
         "next_page_selector": "a[rel='next']",         # pagination link
@@ -222,6 +223,9 @@ SCRAPERS: List[Dict] = [
    document.querySelectorAll("article.property-card")
    ```
 5. Confirm the selector returns the expected elements, then copy it into `SCRAPERS`.
+
+If the site uses numbered pagination, add `pagination_page_selector` as well.
+The scraper can use that selector to infer the last page and stop automatically.
 
 ### Smoke test a new portal
 
