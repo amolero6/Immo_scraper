@@ -10,6 +10,7 @@ Manages two tables:
 
 import logging
 import sqlite3
+import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DB_PATH = Path("immo_scraper.db")
+MAX_REASONABLE_PRICE = 100_000_000.0
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -113,6 +115,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
         conn.executescript(_DDL)
         _ensure_columns(conn)
         _ensure_price_first_seen(conn)
+        _repair_invalid_price_first_seen(conn)
     logger.info("Database ready.")
 
 
@@ -142,6 +145,8 @@ def upsert_property(prop: Dict) -> str:
             (property_id,),
         ).fetchone()
 
+        new_price = _normalize_price(prop.get("price"))
+
         if existing is None:
             # ---- INSERT ----
             conn.execute(
@@ -168,8 +173,8 @@ def upsert_property(prop: Dict) -> str:
                     "source": prop.get("source", "unknown"),
                     "title": prop.get("title"),
                     "url": prop.get("url"),
-                    "price": prop.get("price"),
-                    "price_first_seen": prop.get("price"),
+                    "price": new_price,
+                    "price_first_seen": new_price,
                     "rooms": prop.get("rooms"),
                     "bathrooms": prop.get("bathrooms"),
                     "sqm": prop.get("sqm"),
@@ -198,14 +203,15 @@ def upsert_property(prop: Dict) -> str:
                 },
             )
             # Record the initial price in history
-            if prop.get("price") is not None:
-                _append_price_history(conn, property_id, prop["price"], now)
+            if new_price is not None:
+                _append_price_history(conn, property_id, new_price, now)
             logger.debug("Inserted new property '%s'.", property_id)
             return "inserted"
 
         # ---- UPDATE ----
-        old_price = existing["price"]
-        new_price = prop.get("price")
+        old_price = _normalize_price(existing["price"])
+        existing_first_seen = _normalize_price(existing["price_first_seen"])
+        healed_first_seen = _heal_price_first_seen(existing_first_seen, new_price)
 
         conn.execute(
             """
@@ -237,7 +243,7 @@ def upsert_property(prop: Dict) -> str:
                 is_favourite = :is_favourite,
                 similarity_score = :similarity_score,
                 similarity_profile = :similarity_profile,
-                price_first_seen = COALESCE(price_first_seen, :price_first_seen),
+                price_first_seen = :price_first_seen,
                 last_seen   = :last_seen,
                 status      = 'active'
             WHERE property_id = :property_id
@@ -248,7 +254,7 @@ def upsert_property(prop: Dict) -> str:
                 "title": prop.get("title"),
                 "url": prop.get("url"),
                 "price": new_price,
-                "price_first_seen": new_price,
+                "price_first_seen": healed_first_seen,
                 "rooms": prop.get("rooms"),
                 "bathrooms": prop.get("bathrooms"),
                 "sqm": prop.get("sqm"),
@@ -370,10 +376,49 @@ def _now() -> str:
 
 
 def _append_price_history(conn: sqlite3.Connection, property_id: str, price: int, date: str) -> None:
+    normalized = _normalize_price(price)
+    if normalized is None:
+        return
     conn.execute(
         "INSERT INTO price_history (property_id, price, date) VALUES (?, ?, ?)",
-        (property_id, price, date),
+        (property_id, normalized, date),
     )
+
+
+def _normalize_price(value) -> Optional[float]:
+    """Return a sane finite price or None if the value is invalid/outlier."""
+    if value is None:
+        return None
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(p):
+        return None
+    if p <= 0:
+        return None
+    if p > MAX_REASONABLE_PRICE:
+        return None
+    return p
+
+
+def _heal_price_first_seen(existing_first_seen: Optional[float], new_price: Optional[float]) -> Optional[float]:
+    """Keep first seen price when plausible; otherwise heal it using current price."""
+    if existing_first_seen is None:
+        return new_price
+    if new_price is None:
+        return existing_first_seen
+
+    ratio = existing_first_seen / new_price if new_price else None
+    if ratio is None:
+        return existing_first_seen
+
+    # If the original value is disproportionately far from the current value,
+    # it is usually a parse artifact (concatenated numbers, inf, etc.).
+    if ratio > 50 or ratio < 0.02:
+        return new_price
+
+    return existing_first_seen
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
@@ -435,3 +480,22 @@ def _ensure_price_first_seen(conn: sqlite3.Connection) -> None:
           AND price IS NOT NULL
         """
     )
+
+
+def _repair_invalid_price_first_seen(conn: sqlite3.Connection) -> None:
+        """Repair clearly broken first-seen prices from historical parser artifacts."""
+        conn.execute(
+                """
+                UPDATE properties
+                SET price_first_seen = price
+                WHERE price IS NOT NULL
+                    AND (
+                            price_first_seen IS NULL
+                            OR price_first_seen <= 0
+                            OR price_first_seen > ?
+                            OR price_first_seen > price * 50
+                            OR price_first_seen < price * 0.02
+                    )
+                """,
+                (MAX_REASONABLE_PRICE,),
+        )

@@ -162,6 +162,13 @@ SCRAPERS: List[Dict] = [
         "parse_mode": "aproperties",
         "max_pages": 10,
     },
+    {
+        "source": "fincas_calvo",
+        "base_url": "https://fincascalvo.com/venta/?search=search&textTowns=&zonas=&host_dominio=https%3A%2F%2Ffincascalvo.com&empresa=fincascalvo.com&town%5B%5D=Sant+Cugat+del+Vall%C3%A8s&price-min=&price-max=&ref=",
+        "city": "Sant Cugat del Vallès",
+        "parse_mode": "fincas_calvo",
+        "max_pages": 10,
+    },
     # Add more agencies here following the same shape
 ]
 
@@ -226,6 +233,8 @@ def _scrape_agency(page: Page, cfg: Dict) -> List[Dict]:
         return _scrape_best_house_agency(page, cfg)
     if cfg.get("parse_mode") == "aproperties":
         return _scrape_aproperties_agency(page, cfg)
+    if cfg.get("parse_mode") == "fincas_calvo":
+        return _scrape_fincas_calvo_agency(page, cfg)
     if cfg.get("pagination_mode") == "hash":
         return _scrape_agency_hash_pagination(page, cfg)
     if cfg.get("pagination_mode") == "buttons":
@@ -938,6 +947,132 @@ def _scrape_aproperties_agency(page: Page, cfg: Dict) -> List[Dict]:
             except Exception as exc:
                 logger.warning("Could not parse aProperties card: %s", exc)
                 continue
+
+    return props
+
+
+def _scrape_fincas_calvo_agency(page: Page, cfg: Dict) -> List[Dict]:
+    """Extract Fincas Calvo listing cards and follow pagination links.
+
+    The listing renders cards as `div.property-item` and paginates via
+    `nav.pagination a` links (including a non-standard `?2/?...` pattern).
+    We crawl discovered pagination URLs breadth-first up to `max_pages`.
+    """
+    from urllib.parse import urljoin
+
+    props: List[Dict] = []
+    seen_property_ids: set[str] = set()
+    visited_pages: set[str] = set()
+    queue: List[str] = [cfg["base_url"]]
+    max_pages = cfg.get("max_pages", 10)
+
+    while queue and len(visited_pages) < max_pages:
+        page_url = queue.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        try:
+            page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_selector("div.property-item", timeout=15_000)
+        except PlaywrightTimeout:
+            logger.warning("Timeout/no listings on Fincas Calvo page: %s", page_url)
+            continue
+
+        cards = page.query_selector_all("div.property-item")
+        logger.debug("Fincas Calvo page '%s': %d cards.", page_url, len(cards))
+
+        page_batch_props: List[Dict] = []
+
+        for card in cards:
+            try:
+                link_el = card.query_selector("a.precio-listado")
+                url = link_el.get_attribute("href") if link_el else ""
+                if not url:
+                    layer = card.query_selector(".img-click-layer")
+                    url = layer.get_attribute("data-url") if layer else ""
+                if url and not url.startswith("http"):
+                    url = urljoin(cfg["base_url"], url)
+
+                ref_el = card.query_selector(".ref p")
+                ref_text = (ref_el.inner_text() or "").strip() if ref_el else ""
+
+                type_el = card.query_selector(".custom-info-plus .type")
+                property_type = (type_el.inner_text() or "").strip() if type_el else ""
+
+                city_el = card.query_selector(".type.ciudad")
+                city_text = (city_el.inner_text() or "").strip() if city_el else cfg.get("city", "")
+                city_text = city_text.replace("\n", " ").replace("\t", " ").strip()
+                city_text = re.sub(r"\s+", " ", city_text)
+
+                title = f"{property_type} en {city_text}".strip()
+
+                price_text = (link_el.inner_text() or "") if link_el else ""
+                price = _parse_price(price_text)
+
+                beds_el = card.query_selector("span.beds")
+                bath_el = card.query_selector("span.bath")
+                rooms = _parse_int(beds_el.inner_text() if beds_el else "")
+                bathrooms = _parse_int(bath_el.inner_text() if bath_el else "")
+
+                # Surface is not always present in cards; we'll enrich from detail later.
+                sqm = None
+
+                full_text = card.inner_text().lower()
+                has_pool = int(bool(re.search(r"piscina", full_text)))
+                has_ac = int(bool(re.search(r"aire acondicionado|aire condicionad|aire condicionat", full_text)))
+
+                property_id = _build_id(cfg["source"], url or ref_text)
+                if not property_id or property_id in seen_property_ids:
+                    continue
+
+                seen_property_ids.add(property_id)
+                page_batch_props.append(
+                    {
+                        "property_id": property_id,
+                        "source": cfg["source"],
+                        "title": title,
+                        "url": url,
+                        "price": price,
+                        "rooms": rooms,
+                        "bathrooms": bathrooms,
+                        "sqm": sqm,
+                        "has_pool": has_pool,
+                        "has_ac": has_ac,
+                        "property_type": property_type or None,
+                        "operation": "sale",
+                        "city": cfg.get("city"),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Could not parse Fincas Calvo card: %s", exc)
+                continue
+
+        # Discover next pages from pagination links and enqueue unseen URLs.
+        for a in page.query_selector_all("nav.pagination a[href]"):
+            href = a.get_attribute("href") or ""
+            if not href:
+                continue
+            next_url = urljoin(page.url, href)
+            if "/venta/" not in next_url:
+                continue
+            if next_url not in visited_pages and next_url not in queue:
+                queue.append(next_url)
+
+        # Enrich sqm from detail pages without touching listing element handles.
+        for prop in page_batch_props:
+            if prop.get("sqm") is not None or not prop.get("url"):
+                continue
+            try:
+                page.goto(prop["url"], wait_until="domcontentloaded", timeout=30_000)
+                body = page.locator("body").inner_text()
+                sqm_match = re.search(r"(\d+[\d\.,]*)\s*(?:m²|m2|mts)", body, re.IGNORECASE)
+                if sqm_match:
+                    prop["sqm"] = _parse_int(sqm_match.group(1))
+            except Exception:
+                pass
+
+        props.extend(page_batch_props)
 
     return props
 
