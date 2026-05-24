@@ -37,5 +37,5 @@ properties,"CREATE TABLE properties (
     first_seen   TEXT NOT NULL,       -- ISO-8601 datetime
     last_seen    TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'active'
-)"
+, price_first_seen REAL)"
 sqlite_sequence,"CREATE TABLE sqlite_sequence(name,seq)"

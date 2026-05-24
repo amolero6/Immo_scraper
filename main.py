@@ -29,6 +29,7 @@ from database import init_db, upsert_property, mark_inactive, get_property, get_
 from telegram_bot import send_alert, format_new_property_message, format_price_drop_message
 from scraper_local import scrape_all_local
 from scraper_apify import scrape_idealista
+from run_idealista_headful import scrape_idealista_properties
 from matching import best_similarity_match
 from similarity_config import FAVORITE_PROFILES, MIN_SIMILARITY_SCORE, ALERT_LOCATION_TERMS
 
@@ -61,6 +62,7 @@ MIN_SIMILARITY_SCORE_ALERT: int = MIN_SIMILARITY_SCORE
 
 ENABLE_LOCAL_SCRAPER: bool = True
 ENABLE_APIFY_SCRAPER: bool = False
+ENABLE_IDEALISTA_LOCAL: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +105,15 @@ def run() -> None:
             raw_properties.extend(apify_props)
         except Exception as exc:
             logger.error("Apify scraper failed: %s", exc, exc_info=True)
+
+    if ENABLE_IDEALISTA_LOCAL:
+        logger.info("Running local headful Idealista scraper …")
+        try:
+            idealista_local_props = scrape_idealista_properties()
+            logger.info("Local Idealista scraper returned %d properties.", len(idealista_local_props))
+            raw_properties.extend(idealista_local_props)
+        except Exception as exc:
+            logger.error("Local Idealista scraper failed: %s", exc, exc_info=True)
 
     logger.info("Total properties fetched this run: %d", len(raw_properties))
 

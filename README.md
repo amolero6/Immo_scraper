@@ -2,7 +2,7 @@
 
 Automated real-estate monitoring system for **Sant Cugat del Vallès** and **Cerdanyola del Vallès**.
 
-The system scrapes property listings from Idealista (via Apify) and local agencies (via Playwright), stores them in a local SQLite database, tracks price history, and sends Telegram alerts when a matching opportunity appears or a price drops.
+The system scrapes property listings from Idealista (via Apify or a local headful Playwright runner) and local agencies (via Playwright), stores them in a local SQLite database, tracks price history, and sends Telegram alerts when a matching opportunity appears or a price drops.
 
 ---
 
@@ -39,7 +39,8 @@ The system scrapes property listings from Idealista (via Apify) and local agenci
            ▼                        ▼
 ┌──────────────────┐    ┌───────────────────────┐
 │ scraper_local.py │    │  scraper_apify.py      │
-│  (Playwright)    │    │  (Apify → Idealista)   │
+│  (Playwright)    │    │  (Apify / local headful│
+│                  │    │   → Idealista)         │
 │  amat.es, etc.   │    │                        │
 └────────┬─────────┘    └───────────┬───────────┘
          │                          │
@@ -259,6 +260,20 @@ Make sure your virtual environment is active, then:
 ```bash
 python main.py
 ```
+
+If you want the local headful Idealista runner to attach to a Chrome session you opened yourself, start Chrome first with remote debugging enabled:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/idealista-debug-profile
+```
+
+Then run the Idealista headful runner directly:
+
+```bash
+$REPO_PATH/Immo_scraper/.venv/bin/python run_idealista_headful.py
+```
+
+To include the local headful Idealista source inside the main orchestrator, set `ENABLE_IDEALISTA_LOCAL=true` in `.env` and keep the same Chrome session open while `main.py` runs.
 
 You will see structured log output:
 

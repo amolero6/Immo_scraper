@@ -49,6 +49,7 @@ ACTOR_INPUT: Dict = {
                 "con-mas-de-3-habitaciones,mas-de-2-banos/"
             )
         },
+
     ],
     # Maximum number of listings to retrieve per run
     "maxItems": 200,

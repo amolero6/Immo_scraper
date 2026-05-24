@@ -16,11 +16,136 @@ from __future__ import annotations
 import logging
 import re
 import json
+import time
+import random
 from typing import List, Dict
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 logger = logging.getLogger(__name__)
+
+
+def _goto_with_retry(page: Page, url: str, source: str) -> bool:
+    """Navigate with a fallback strategy for portals that intermittently stall."""
+    attempts = [
+        ("domcontentloaded", 30_000),
+        ("commit", 60_000),
+    ]
+    for idx, (wait_until, timeout_ms) in enumerate(attempts, start=1):
+        # small random delay to mimic human pacing
+        time.sleep(random.uniform(0.3, 1.2))
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            return True
+        except PlaywrightTimeout:
+            logger.warning(
+                "[%s] Timeout loading '%s' (attempt %d/%d, wait_until=%s, timeout=%sms).",
+                source,
+                url,
+                idx,
+                len(attempts),
+                wait_until,
+                timeout_ms,
+            )
+    return False
+
+
+def _humanize_page_actions(page: Page) -> None:
+    """Perform small human-like interactions: accept cookies, scroll and move mouse."""
+    try:
+        # Try common cookie buttons
+        cookie_texts = [
+            "aceptar", "acepto", "aceptar todas", "aceptar cookies", "aceptar todo",
+            "accept", "accept all", "agree",
+        ]
+        buttons = page.query_selector_all("button")
+        for btn in buttons:
+            try:
+                txt = (btn.inner_text() or "").lower().strip()
+                for ct in cookie_texts:
+                    if ct in txt:
+                        try:
+                            btn.click(timeout=3000)
+                            time.sleep(random.uniform(0.5, 1.2))
+                            break
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+        # Small scrolls and mouse moves
+        try:
+            page.evaluate("() => {window.scrollTo(0, 200);}")
+            time.sleep(random.uniform(0.4, 1.0))
+            page.evaluate("() => {window.scrollTo(0, 0);}")
+            time.sleep(random.uniform(0.3, 0.8))
+        except Exception:
+            pass
+
+        # Fallback mouse movements if available
+        try:
+            box = page.viewport_size or {"width": 1366, "height": 900}
+            w = box.get("width", 1366)
+            h = box.get("height", 900)
+            # move in a gentle curve
+            for x, y in [(w*0.3,h*0.3),(w*0.6,h*0.4),(w*0.5,h*0.6)]:
+                try:
+                    page.mouse.move(int(x), int(y), steps=6)
+                    time.sleep(random.uniform(0.2, 0.6))
+                except Exception:
+                    break
+        except Exception:
+            pass
+        # small randomized tab/keypress interactions
+        try:
+            for _ in range(random.randint(0, 2)):
+                try:
+                    page.keyboard.press('Tab')
+                    time.sleep(random.uniform(0.05, 0.25))
+                except Exception:
+                    break
+        except Exception:
+            pass
+        # gentle slow scroll pass
+        try:
+            _slow_scroll_page(page)
+        except Exception:
+            pass
+    except Exception:
+        return
+
+
+def _slow_scroll_page(page: Page, steps: int = 12, pause: float | None = None) -> None:
+    """Scroll slowly down and up the page in several steps to mimic reading.
+
+    Args:
+        page: Playwright Page
+        steps: number of incremental steps to reach bottom
+        pause: base pause between steps in seconds (randomized if None)
+    """
+    try:
+        size = page.viewport_size or {"width": 1366, "height": 900}
+        h = size.get("height", 900)
+        # get full document height
+        doc_h = page.evaluate("() => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)") or (h * 3)
+        step_h = max(200, int(doc_h / max(steps, 1)))
+        for i in range(0, doc_h, step_h):
+            try:
+                page.evaluate(f"() => window.scrollTo(0, {i})")
+            except Exception:
+                break
+            time.sleep(random.uniform(0.12, 0.5) if pause is None else pause + random.uniform(-0.05, 0.05))
+        # pause at bottom
+        time.sleep(random.uniform(0.6, 1.2))
+        # scroll back up a bit
+        for i in range(doc_h, 0, -step_h):
+            try:
+                page.evaluate(f"() => window.scrollTo(0, {max(0, i- int(step_h/2))})")
+            except Exception:
+                break
+            time.sleep(random.uniform(0.08, 0.35))
+    except Exception:
+        return
 
 # ---------------------------------------------------------------------------
 # Configuration – edit these per agency
@@ -169,6 +294,24 @@ SCRAPERS: List[Dict] = [
         "parse_mode": "fincas_calvo",
         "max_pages": 10,
     },
+    {
+        "source": "yaencontre",
+        "base_url": "https://www.yaencontre.com/venta/pisos/sant-cugat-del-valles",
+        "city": "Sant Cugat del Vallès",
+        "listing_selector": "article",
+        "title_selector": "h3 a",
+        "price_selector": "h3",
+        "link_selector": "h3 a",
+        "rooms_selector": "p [role='generic']:nth-of-type(1)",
+        "bathrooms_selector": "p [role='generic']:nth-of-type(2)",
+        "sqm_selector": "p [role='generic']:nth-of-type(3)",
+        "pool_keyword": "piscina",
+        "ac_keyword": "aire condicionado",
+        "pagination_button_selector": "button",
+        "pagination_next_texts": ["›", "»", "Siguiente", "Next"],
+        "max_pages": 10,
+        "parse_mode": "yaencontre",
+    },
     # Add more agencies here following the same shape
 ]
 
@@ -187,20 +330,42 @@ def scrape_all_local() -> List[Dict]:
     all_props: List[Dict] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-background-timer-throttling",
+            ],
+            slow_mo=25,
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
+            locale='es-ES',
+            timezone_id='Europe/Madrid',
+            viewport={'width': 1366, 'height': 900},
         )
+        try:
+            context.add_init_script(
+                "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['es-ES','es']}); Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]}); window.chrome = { runtime: {} }; }"
+            )
+        except Exception:
+            pass
         page = context.new_page()
 
         for cfg in SCRAPERS:
             logger.info("Scraping source: %s", cfg["source"])
             try:
-                props = _scrape_agency(page, cfg)
+                if cfg.get("source") == "yaencontre":
+                    props = _scrape_yaencontre_with_headed_fallback(pw, page, cfg)
+                else:
+                    props = _scrape_agency(page, cfg)
                 logger.info(
                     "Source '%s': %d properties found.", cfg["source"], len(props)
                 )
@@ -213,6 +378,101 @@ def scrape_all_local() -> List[Dict]:
         browser.close()
 
     return all_props
+
+
+def _looks_like_datadome_challenge(page: Page) -> bool:
+    """Detect Yaencontre/DataDome challenge shell returned to bots."""
+    try:
+        html = page.content().lower()
+    except Exception:
+        return False
+
+    title = ""
+    try:
+        title = (page.title() or "").strip().lower()
+    except Exception:
+        pass
+
+    return ("var dd=" in html or "datadome" in html) and title == "yaencontre.com"
+
+
+def _scrape_yaencontre_with_headed_fallback(pw, page: Page, cfg: Dict) -> List[Dict]:
+    """Try Yaencontre in shared headless page first, then fallback to headed browser."""
+    props = _scrape_yaencontre_agency(page, cfg)
+    if props:
+        return props
+
+    if not _looks_like_datadome_challenge(page):
+        return props
+
+    logger.warning(
+        "[%s] DataDome challenge detected in headless mode; retrying with headed browser.",
+        cfg["source"],
+    )
+
+    # Allow opting-in to headed fallback via environment var to avoid unexpected
+    # UI pops when running automated CI or background jobs.
+    import os
+    allow_headed = os.getenv("YAENCONTRE_ALLOW_HEADED_FALLBACK", "false").lower() in ("1", "true", "yes")
+
+    if not allow_headed:
+        logger.warning(
+            "[%s] DataDome detected. To enable an automatic headed retry set env YAENCONTRE_ALLOW_HEADED_FALLBACK=1 or use a residential proxy (recommended).",
+            cfg["source"],
+        )
+        return []
+
+    retry_browser = None
+    try:
+        # Launch a headed browser with more stealth flags and slower emulation
+        retry_browser = pw.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        retry_context = retry_browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="es-ES",
+            timezone_id="Europe/Madrid",
+            viewport={"width": 1366, "height": 900},
+            java_script_enabled=True,
+        )
+        # Stealth: hide webdriver and set languages
+        retry_context.add_init_script(
+            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['es-ES','es']}); }"
+        )
+        retry_page = retry_context.new_page()
+
+        # Small, deliberate delays to mimic human navigation
+        retry_page.set_default_navigation_timeout(120_000)
+        retry_page.set_default_timeout(120_000)
+
+        props = _scrape_yaencontre_agency(retry_page, cfg)
+        try:
+            retry_context.close()
+        except Exception:
+            pass
+        return props
+    except Exception as exc:
+        logger.warning(
+            "[%s] Headed fallback failed: %s",
+            cfg["source"],
+            exc,
+        )
+        return []
+    finally:
+        if retry_browser:
+            try:
+                retry_browser.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +495,8 @@ def _scrape_agency(page: Page, cfg: Dict) -> List[Dict]:
         return _scrape_aproperties_agency(page, cfg)
     if cfg.get("parse_mode") == "fincas_calvo":
         return _scrape_fincas_calvo_agency(page, cfg)
+    if cfg.get("parse_mode") == "yaencontre":
+        return _scrape_yaencontre_agency(page, cfg)
     if cfg.get("pagination_mode") == "hash":
         return _scrape_agency_hash_pagination(page, cfg)
     if cfg.get("pagination_mode") == "buttons":
@@ -287,6 +549,196 @@ def _scrape_agency(page: Page, cfg: Dict) -> List[Dict]:
         pages_scraped += 1
 
     return props
+
+
+def _scrape_yaencontre_agency(page: Page, cfg: Dict) -> List[Dict]:
+    """Extract listings from YaEncontre portal with button pagination."""
+    props: List[Dict] = []
+    seen_property_ids: set[str] = set()
+    
+    if not _goto_with_retry(page, cfg["base_url"], cfg["source"]):
+        logger.warning("Timeout loading '%s' – skipping.", cfg["base_url"])
+        return props
+
+    # Perform human-like actions to reduce bot detection
+    _humanize_page_actions(page)
+
+    try:
+        page.wait_for_selector(cfg["listing_selector"], timeout=25_000)
+    except PlaywrightTimeout:
+        # Yaencontre can be slow to hydrate in headless mode; one reload helps on flaky runs.
+        logger.debug(
+            "[%s] Listing selector '%s' not found after first load; retrying once.",
+            cfg["source"],
+            cfg["listing_selector"],
+        )
+        if not _goto_with_retry(page, cfg["base_url"], cfg["source"]):
+            return props
+        try:
+            page.wait_for_selector(cfg["listing_selector"], timeout=25_000)
+        except PlaywrightTimeout:
+            logger.warning(
+                "[%s] No listing cards found on '%s' with selector '%s'.",
+                cfg["source"],
+                cfg["base_url"],
+                cfg["listing_selector"],
+            )
+            return props
+
+    if page.title().strip().lower() == "yaencontre.com" and not page.query_selector_all(cfg["listing_selector"]):
+        logger.warning(
+            "[%s] Yaencontre loaded a non-listing shell page (likely anti-bot/cookie gate).",
+            cfg["source"],
+        )
+        return props
+    
+    # Determine expected pages from total heading if available
+    total_pages_override = None
+    try:
+        h1 = page.query_selector('h1')
+        if h1:
+            h1txt = h1.inner_text() or ""
+            m = re.search(r"(\d[\d\.\s]*)\s+Pisos", h1txt)
+            if m:
+                total = int(m.group(1).replace('.', '').replace(' ', ''))
+                # Items per page: count current cards and derive pages
+                current_cards = len(page.query_selector_all(cfg['listing_selector']))
+                if current_cards > 0:
+                    pages = (total + current_cards - 1) // current_cards
+                    total_pages_override = min(pages, cfg.get('max_pages', 10))
+    except Exception:
+        total_pages_override = None
+
+    max_pages_to_scrape = total_pages_override or cfg.get("max_pages", 10)
+
+    base = cfg['base_url'].rstrip('/')
+
+    for page_num in range(1, max_pages_to_scrape + 1):
+        target_url = base if page_num == 1 else f"{base}/pag-{page_num}"
+        logger.debug("Fetching YaEncontre page %d -> %s", page_num, target_url)
+
+        if not _goto_with_retry(page, target_url, cfg['source']):
+            logger.warning("Timeout loading '%s' – stopping pagination.", target_url)
+            break
+
+        # Humanize and wait for listings
+        _humanize_page_actions(page)
+        try:
+            page.wait_for_selector(cfg["listing_selector"], timeout=20_000)
+        except PlaywrightTimeout:
+            logger.warning("No listings found on page %d (%s) – stopping.", page_num, target_url)
+            break
+
+        cards = page.query_selector_all(cfg["listing_selector"])
+        logger.debug("Found %d cards on page %d.", len(cards), page_num)
+
+        if not cards:
+            break
+
+        for card in cards:
+            prop = _extract_yaencontre_property(card, cfg)
+            if prop and prop["property_id"] not in seen_property_ids:
+                props.append(prop)
+                seen_property_ids.add(prop["property_id"])
+
+        # small pause between page navigations
+        time.sleep(random.uniform(0.6, 1.4))
+    
+    return props
+
+
+def _extract_yaencontre_property(card, cfg: Dict) -> Dict | None:
+    """Extract YaEncontre property from a card element."""
+    try:
+        # Title and URL
+        title_el = card.query_selector(cfg["title_selector"])
+        if not title_el:
+            return None
+        
+        title = title_el.inner_text().strip() if title_el else ""
+        url = title_el.get_attribute("href") if title_el else ""
+        if url and not url.startswith("http"):
+            from urllib.parse import urljoin
+            url = urljoin(cfg["base_url"], url)
+        
+        if not url:
+            return None
+        
+        # Price: The h3 selector might have changed; search for € symbol in card content
+        # First try the configured selector
+        price_el = card.query_selector(cfg["price_selector"])
+        price_text = price_el.inner_text() if price_el else ""
+        
+        # If no price found or if price is clearly wrong (< 100), search for € in the card
+        price = _parse_price(price_text) if price_text else None
+        
+        # Fallback: search for any element containing € in the card
+        if price is None or price < 100:
+            all_text = card.inner_text()
+            # Extract first euro amount from card text
+            euro_match = re.search(r"(\d[\d\.\s]*)\s*€", all_text)
+            if euro_match:
+                price = _parse_price(euro_match.group(1))
+            # If still no price, try searching for specific price patterns
+            if price is None or price < 100:
+                price_patterns = re.findall(r"(\d{3,}[\.\s\d]*)\s*€", all_text)
+                if price_patterns:
+                    price = _parse_price(price_patterns[0])
+        
+        # Rooms, bathrooms, sqm from generic elements in paragraph
+        rooms = None
+        bathrooms = None
+        sqm = None
+        
+        # Try to find paragraph with generic elements
+        specs_container = card.query_selector("p")
+        if specs_container:
+            specs = specs_container.query_selector_all("[role='generic']")
+            if len(specs) > 0:
+                rooms = _parse_int(specs[0].inner_text())
+            if len(specs) > 1:
+                bathrooms = _parse_int(specs[1].inner_text())
+            if len(specs) > 2:
+                sqm = _parse_int(specs[2].inner_text())
+        
+        # Boolean features
+        full_text = card.inner_text().lower()
+        has_pool = cfg.get("pool_keyword", "piscina") in full_text
+        has_ac = cfg.get("ac_keyword", "aire condicionado") in full_text
+        
+        property_id = _build_id(cfg["source"], url)
+        
+        return {
+            "property_id": property_id,
+            "source": cfg["source"],
+            "title": title,
+            "url": url,
+            "price": price,
+            "rooms": rooms,
+            "bathrooms": bathrooms,
+            "sqm": sqm,
+            "has_pool": has_pool,
+            "has_ac": has_ac,
+            "orientation": None,
+            "property_type": cfg.get("property_type"),
+            "operation": cfg.get("operation"),
+            "city": cfg.get("city"),
+            "district": cfg.get("district"),
+            "neighborhood": cfg.get("neighborhood"),
+            "postal_code": cfg.get("postal_code"),
+            "latitude": cfg.get("latitude"),
+            "longitude": cfg.get("longitude"),
+            "energy_rating": cfg.get("energy_rating"),
+            "year_built": cfg.get("year_built"),
+            "floor": cfg.get("floor"),
+            "terrace": int(bool(cfg.get("terrace", False))),
+            "elevator": int(bool(cfg.get("elevator", False))),
+            "parking": int(bool(cfg.get("parking", False))),
+            "is_favourite": int(bool(cfg.get("is_favourite", False))),
+        }
+    except Exception as exc:
+        logger.warning("Could not parse YaEncontre property card: %s", exc)
+        return None
 
 
 def _scrape_moragas_agency(page: Page, cfg: Dict) -> List[Dict]:
