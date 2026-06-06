@@ -99,16 +99,28 @@ def _get_conn():
 # Public API
 # ---------------------------------------------------------------------------
 
-def init_db(db_path: Optional[Path] = None) -> None:
+def init_db(db_path: Optional[Path] = None, population: Optional[str] = None) -> None:
     """
     Create the database and tables if they do not yet exist.
 
     Args:
         db_path: Override the default DB path (useful for testing).
+        population: Population name (e.g. "sant_cugat", "sant_quirze", "cerdanyola").
+                   Sant Cugat uses "immo_scraper.db"; others use "immo_scraper_{population}.db".
+                   Ignored if db_path is explicitly provided.
     """
     global DB_PATH
     if db_path is not None:
         DB_PATH = db_path
+    elif population is not None:
+        # Sant Cugat uses the default DB path; other populations get their own
+        if population == "sant_cugat":
+            DB_PATH = Path("immo_scraper.db")
+        else:
+            DB_PATH = Path(f"immo_scraper_{population}.db")
+    else:
+        # Default to Sant Cugat if neither is specified
+        DB_PATH = Path("immo_scraper.db")
 
     logger.info("Initialising database at '%s'", DB_PATH)
     with _get_conn() as conn:
@@ -296,13 +308,15 @@ def upsert_property(prop: Dict) -> str:
         return "updated"
 
 
-def mark_inactive(active_ids: list) -> int:
+def mark_inactive(active_ids: list, skip_sources: Optional[list] = None) -> int:
     """
     Set ``status = 'inactive'`` for every property whose ``property_id``
-    is **not** in *active_ids*.
+    is **not** in *active_ids* and whose source is not excluded.
 
     Call this at the end of each scraping run, passing the full list of IDs
-    seen in that run.
+    seen in that run. If a scraper failed or returned 0 results, pass its
+    source name in ``skip_sources`` so its historical rows are not marked
+    inactive by accident.
 
     Args:
         active_ids: List of property IDs observed in the current run.
@@ -310,14 +324,25 @@ def mark_inactive(active_ids: list) -> int:
     Returns:
         Number of properties marked inactive.
     """
-    if not active_ids:
+    if not active_ids and not skip_sources:
         logger.warning(
             "mark_inactive called with an empty list – no properties will be deactivated."
         )
         return 0
 
-    placeholders = ",".join("?" * len(active_ids))
     now = _now()
+    conditions = ["status = 'active'"]
+    params = [now]
+
+    if active_ids:
+        placeholders = ",".join("?" * len(active_ids))
+        conditions.append(f"property_id NOT IN ({placeholders})")
+        params.extend(active_ids)
+
+    if skip_sources:
+        source_placeholders = ",".join("?" * len(skip_sources))
+        conditions.append(f"source NOT IN ({source_placeholders})")
+        params.extend(list(skip_sources))
 
     with _get_conn() as conn:
         cursor = conn.execute(
@@ -325,10 +350,9 @@ def mark_inactive(active_ids: list) -> int:
             UPDATE properties
             SET status    = 'inactive',
                 last_seen = ?
-            WHERE status = 'active'
-              AND property_id NOT IN ({placeholders})
+            WHERE {' AND '.join(conditions)}
             """,
-            [now] + list(active_ids),
+            params,
         )
         count = cursor.rowcount
 

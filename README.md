@@ -267,13 +267,27 @@ If you want the local headful Idealista runner to attach to a Chrome session you
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/idealista-debug-profile
 ```
 
+If you want Yaencontre to run in its own dedicated Chrome session, start a second Chrome with a different port and profile:
+
+```bash
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9233 --user-data-dir=/tmp/yaencontre-debug-profile
+```
+
 Then run the Idealista headful runner directly:
 
 ```bash
 $REPO_PATH/Immo_scraper/.venv/bin/python run_idealista_headful.py
 ```
 
+Then run the Yaencontre headful runner directly, or let `main.py` pick it up automatically through `YAENCONTRE_CDP_URL`:
+
+```bash
+YAENCONTRE_CDP_URL=http://127.0.0.1:9233 $REPO_PATH/Immo_scraper/.venv/bin/python run_yaencontre_headful.py
+```
+
 To include the local headful Idealista source inside the main orchestrator, set `ENABLE_IDEALISTA_LOCAL=true` in `.env` and keep the same Chrome session open while `main.py` runs.
+
+To make Yaencontre use the dedicated Chrome session inside `main.py`, set `YAENCONTRE_CDP_URL=http://127.0.0.1:9233` in `.env`.
 
 You will see structured log output:
 

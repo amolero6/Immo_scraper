@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from database import init_db, upsert_property
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -13,8 +13,21 @@ from scraper_local import _humanize_page_actions, _parse_int, _parse_price
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://www.idealista.com/venta-viviendas/sant-cugat-del-valles-barcelona/"
-MAX_PAGES = int(os.getenv("IDEALISTA_MAX_PAGES", "10"))
+# URLs and configuration for different populations
+IDEALISTA_URLS = {
+    "sant_cugat": "https://www.idealista.com/venta-viviendas/sant-cugat-del-valles-barcelona/",
+    "sant_quirze": "https://www.idealista.com/venta-viviendas/sant-quirze-del-valles-barcelona/",
+    "cerdanyola": "https://www.idealista.com/venta-viviendas/cerdanyola-del-valles-barcelona/",
+}
+
+IDEALISTA_CITIES = {
+    "sant_cugat": "Sant Cugat del Vallès",
+    "sant_quirze": "Sant Quirze del Vallès",
+    "cerdanyola": "Cerdanyola del Vallès",
+}
+
+BASE_URL = IDEALISTA_URLS["sant_cugat"]  # Default for backward compatibility
+MAX_PAGES = int(os.getenv("IDEALISTA_MAX_PAGES", "20"))
 WAIT_FOR_VERIFICATION_SECONDS = int(os.getenv("IDEALISTA_WAIT_FOR_VERIFICATION_SECONDS", "60"))
 
 
@@ -39,7 +52,33 @@ def main() -> int:
     return 0
 
 
-def scrape_idealista_properties() -> List[Dict]:
+def scrape_idealista_properties(population: str = "sant_cugat") -> List[Dict]:
+    """
+    Scrape Idealista properties for a given population.
+    
+    Args:
+        population: Population key (e.g., "sant_cugat", "sant_quirze", "cerdanyola")
+    
+    Returns:
+        List of property dictionaries.
+    """
+    url = IDEALISTA_URLS.get(population, IDEALISTA_URLS["sant_cugat"])
+    city = IDEALISTA_CITIES.get(population, IDEALISTA_CITIES["sant_cugat"])
+    return _scrape_idealista_properties_generic(url, city, MAX_PAGES)
+
+
+def _scrape_idealista_properties_generic(base_url: str, city: str, max_pages: int) -> List[Dict]:
+    """
+    Generic Idealista scraper that works for any population.
+    
+    Args:
+        base_url: The Idealista URL to scrape
+        city: The city/population name for the property records
+        max_pages: Maximum number of pages to scrape
+    
+    Returns:
+        List of property dictionaries.
+    """
     props: List[Dict] = []
     seen_ids: set[str] = set()
 
@@ -89,8 +128,8 @@ def scrape_idealista_properties() -> List[Dict]:
         page = context.pages[0] if context.pages else context.new_page()
 
         logger.info("Using Chrome channel for the headful browser.")
-        logger.info("Opening Idealista listing: %s", BASE_URL)
-        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
+        logger.info("Opening Idealista listing: %s", base_url)
+        page.goto(base_url, wait_until="domcontentloaded", timeout=30_000)
 
         logger.info(
             "If Idealista shows device verification, wait until the listings are visible in the browser and then press Enter here.",
@@ -102,7 +141,7 @@ def scrape_idealista_properties() -> List[Dict]:
         if page.is_closed():
             logger.warning("The current page was closed; opening a fresh page on the same context.")
             page = context.new_page()
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30_000)
+            page.goto(base_url, wait_until="domcontentloaded", timeout=30_000)
             input("Press Enter once Idealista listings are visible again...")
 
         _humanize_page_actions(page)
@@ -113,7 +152,7 @@ def scrape_idealista_properties() -> List[Dict]:
 
         if page.is_closed():
             logger.error("Page closed before scraping could start.")
-            return 1
+            return []
 
         total_results = _extract_total_results(page)
         if total_results is not None:
@@ -125,7 +164,7 @@ def scrape_idealista_properties() -> List[Dict]:
             )
 
         page_num = 1
-        while page_num <= MAX_PAGES:
+        while page_num <= max_pages:
             try:
                 page.wait_for_selector("article.item", timeout=30_000)
             except PlaywrightTimeout:
@@ -136,7 +175,7 @@ def scrape_idealista_properties() -> List[Dict]:
             logger.info("Page %d: found %d article cards.", page_num, len(cards))
 
             for card in cards:
-                prop = _extract_idealista_property(card)
+                prop = _extract_idealista_property(card, city)
                 if not prop:
                     continue
                 if prop["property_id"] in seen_ids:
@@ -144,8 +183,8 @@ def scrape_idealista_properties() -> List[Dict]:
                 props.append(prop)
                 seen_ids.add(prop["property_id"])
 
-            if page_num >= MAX_PAGES:
-                logger.info("Reached configured max pages (%d); stopping.", MAX_PAGES)
+            if page_num >= max_pages:
+                logger.info("Reached configured max pages (%d); stopping.", max_pages)
                 break
 
             if not _go_to_next_page(page):
@@ -247,7 +286,7 @@ def _log_extraction_quality(props: List[Dict]) -> None:
     logger.info("Sample extracted property fields: %s", preview)
 
 
-def _extract_idealista_property(card) -> Dict | None:
+def _extract_idealista_property(card, city: str) -> Dict | None:
     try:
         title_el = card.query_selector('a[href*="/inmueble/"]')
         if not title_el:
@@ -313,7 +352,7 @@ def _extract_idealista_property(card) -> Dict | None:
             "orientation": None,
             "property_type": None,
             "operation": "sale",
-            "city": "Sant Cugat del Vallès",
+            "city": city,
             "district": None,
             "neighborhood": None,
             "postal_code": None,

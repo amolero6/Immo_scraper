@@ -14,11 +14,12 @@ Dependencies:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import json
 import time
 import random
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
@@ -320,7 +321,7 @@ SCRAPERS: List[Dict] = [
 # Public entry-point
 # ---------------------------------------------------------------------------
 
-def scrape_all_local() -> List[Dict]:
+def scrape_all_local(return_metadata: bool = False, exclude_sources: List[str] | None = None):
     """
     Run all configured local scrapers and return a flat list of property dicts.
 
@@ -328,6 +329,9 @@ def scrape_all_local() -> List[Dict]:
         List of property dictionaries ready to be upserted into the database.
     """
     all_props: List[Dict] = []
+    failed_sources: List[str] = []
+    successful_sources: List[str] = []
+    source_counts: Dict[str, int] = {}
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -360,22 +364,42 @@ def scrape_all_local() -> List[Dict]:
         page = context.new_page()
 
         for cfg in SCRAPERS:
+            if exclude_sources and cfg.get("source") in set(exclude_sources):
+                logger.info("Skipping excluded source: %s", cfg.get("source"))
+                continue
             logger.info("Scraping source: %s", cfg["source"])
             try:
                 if cfg.get("source") == "yaencontre":
                     props = _scrape_yaencontre_with_headed_fallback(pw, page, cfg)
                 else:
                     props = _scrape_agency(page, cfg)
-                logger.info(
-                    "Source '%s': %d properties found.", cfg["source"], len(props)
-                )
-                all_props.extend(props)
+                if props:
+                    logger.info(
+                        "Source '%s': %d properties found.", cfg["source"], len(props)
+                    )
+                    all_props.extend(props)
+                    successful_sources.append(cfg["source"])
+                    source_counts[cfg["source"]] = len(props)
+                else:
+                    logger.warning(
+                        "Source '%s' returned 0 properties; treating it as unavailable for this run.",
+                        cfg["source"],
+                    )
+                    failed_sources.append(cfg["source"])
             except Exception as exc:
                 logger.error(
                     "Error scraping '%s': %s", cfg["source"], exc, exc_info=True
                 )
+                failed_sources.append(cfg["source"])
 
         browser.close()
+
+    if return_metadata:
+        return all_props, {
+            "failed_sources": failed_sources,
+            "successful_sources": successful_sources,
+            "source_counts": source_counts,
+        }
 
     return all_props
 
@@ -397,53 +421,62 @@ def _looks_like_datadome_challenge(page: Page) -> bool:
 
 
 def _scrape_yaencontre_with_headed_fallback(pw, page: Page, cfg: Dict) -> List[Dict]:
-    """Try Yaencontre in shared headless page first, then fallback to headed browser."""
-    props = _scrape_yaencontre_agency(page, cfg)
-    if props:
-        return props
+    """Scrape Yaencontre directly in a headed browser because headless is blocked by DataDome."""
 
-    if not _looks_like_datadome_challenge(page):
-        return props
-
-    logger.warning(
-        "[%s] DataDome challenge detected in headless mode; retrying with headed browser.",
+    logger.info(
+        "[%s] Using headed browser by default because Yaencontre is blocked in headless mode.",
         cfg["source"],
     )
 
-    # Allow opting-in to headed fallback via environment var to avoid unexpected
-    # UI pops when running automated CI or background jobs.
-    import os
-    allow_headed = os.getenv("YAENCONTRE_ALLOW_HEADED_FALLBACK", "false").lower() in ("1", "true", "yes")
-
-    if not allow_headed:
-        logger.warning(
-            "[%s] DataDome detected. To enable an automatic headed retry set env YAENCONTRE_ALLOW_HEADED_FALLBACK=1 or use a residential proxy (recommended).",
-            cfg["source"],
-        )
-        return []
-
     retry_browser = None
+    retry_context = None
+    connected_via_cdp = False
+    owns_context = False
     try:
-        # Launch a headed browser with more stealth flags and slower emulation
-        retry_browser = pw.chromium.launch(
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-            ],
-        )
-        retry_context = retry_browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="es-ES",
-            timezone_id="Europe/Madrid",
-            viewport={"width": 1366, "height": 900},
-            java_script_enabled=True,
-        )
+        cdp_url = os.getenv("YAENCONTRE_CDP_URL", "http://127.0.0.1:9234").strip()
+        if cdp_url:
+            try:
+                logger.info("[%s] Connecting to dedicated Chrome via CDP: %s", cfg["source"], cdp_url)
+                retry_browser = pw.chromium.connect_over_cdp(cdp_url)
+                connected_via_cdp = True
+            except Exception as exc:
+                logger.warning(
+                    "[%s] CDP attach failed (%s); falling back to a fresh headed browser.",
+                    cfg["source"],
+                    exc,
+                )
+
+        if retry_browser is None:
+            # Launch a headed browser with more stealth flags and slower emulation.
+            retry_browser = pw.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ],
+            )
+
+        if retry_browser.contexts:
+            retry_context = retry_browser.contexts[0]
+            logger.info(
+                "[%s] Reusing the existing browser context so cookies/profile survive across runs.",
+                cfg["source"],
+            )
+        else:
+            retry_context = retry_browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="es-ES",
+                timezone_id="Europe/Madrid",
+                viewport={"width": 1366, "height": 900},
+                java_script_enabled=True,
+            )
+            owns_context = True
+
         # Stealth: hide webdriver and set languages
         retry_context.add_init_script(
             "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['es-ES','es']}); }"
@@ -456,7 +489,14 @@ def _scrape_yaencontre_with_headed_fallback(pw, page: Page, cfg: Dict) -> List[D
 
         props = _scrape_yaencontre_agency(retry_page, cfg)
         try:
-            retry_context.close()
+            if connected_via_cdp:
+                try:
+                    retry_browser.disconnect()
+                except Exception:
+                    pass
+            elif owns_context and retry_context:
+                retry_context.close()
+                retry_browser.close()
         except Exception:
             pass
         return props
@@ -470,7 +510,15 @@ def _scrape_yaencontre_with_headed_fallback(pw, page: Page, cfg: Dict) -> List[D
     finally:
         if retry_browser:
             try:
-                retry_browser.close()
+                if connected_via_cdp:
+                    try:
+                        retry_browser.disconnect()
+                    except Exception:
+                        pass
+                else:
+                    if owns_context and retry_context:
+                        retry_context.close()
+                    retry_browser.close()
             except Exception:
                 pass
 
@@ -685,21 +733,32 @@ def _extract_yaencontre_property(card, cfg: Dict) -> Dict | None:
                 if price_patterns:
                     price = _parse_price(price_patterns[0])
         
-        # Rooms, bathrooms, sqm from generic elements in paragraph
-        rooms = None
-        bathrooms = None
-        sqm = None
-        
-        # Try to find paragraph with generic elements
-        specs_container = card.query_selector("p")
-        if specs_container:
-            specs = specs_container.query_selector_all("[role='generic']")
-            if len(specs) > 0:
-                rooms = _parse_int(specs[0].inner_text())
-            if len(specs) > 1:
-                bathrooms = _parse_int(specs[1].inner_text())
-            if len(specs) > 2:
-                sqm = _parse_int(specs[2].inner_text())
+        # Rooms, bathrooms and sqm can move around in the Yaencontre card.
+        # Prefer selectors when they still work, then fall back to text labels.
+        rooms = _extract_yaencontre_metric(
+            card,
+            cfg,
+            "rooms_selector",
+            label_patterns=("hab", "habit", "dorm"),
+            regex_patterns=(r"(\d+)\s*(?:hab(?:itaci[oó]n)?s?|dormit(?:ori|orio)s?|hab\.)",),
+            fallback_index=0,
+        )
+        bathrooms = _extract_yaencontre_metric(
+            card,
+            cfg,
+            "bathrooms_selector",
+            label_patterns=("bañ", "bany", "bath", "wc"),
+            regex_patterns=(r"(\d+)\s*(?:banys?|bañ(?:o|os)?|ba\w*|bath(?:room)?s?|wc)",),
+            fallback_index=1,
+        )
+        sqm = _extract_yaencontre_metric(
+            card,
+            cfg,
+            "sqm_selector",
+            label_patterns=("m²", "m2", "superf", "metre", "metro"),
+            regex_patterns=(r"(\d+(?:[.,]\d+)?)\s*(?:m²|m2|m\xb2|metres?|metros?|superf\w*)",),
+            fallback_index=2,
+        )
         
         # Boolean features
         full_text = card.inner_text().lower()
@@ -739,6 +798,59 @@ def _extract_yaencontre_property(card, cfg: Dict) -> Dict | None:
     except Exception as exc:
         logger.warning("Could not parse YaEncontre property card: %s", exc)
         return None
+
+
+def _extract_yaencontre_metric(
+    card,
+    cfg: Dict,
+    selector_key: str,
+    label_patterns: tuple[str, ...],
+    regex_patterns: tuple[str, ...],
+    fallback_index: int,
+) -> int | None:
+    selector = cfg.get(selector_key)
+    if selector:
+        try:
+            selector_el = card.query_selector(selector)
+            if selector_el:
+                parsed = _parse_int(selector_el.inner_text() or "")
+                if parsed is not None:
+                    return parsed
+        except Exception:
+            pass
+
+    candidate_nodes = card.query_selector_all("p [role='generic']")
+    candidate_texts = []
+    for node in candidate_nodes:
+        try:
+            text = (node.inner_text() or "").strip()
+        except Exception:
+            continue
+        if text:
+            candidate_texts.append(text)
+
+    for text in candidate_texts:
+        lowered = text.lower()
+        if any(pattern in lowered for pattern in label_patterns):
+            parsed = _parse_int(text)
+            if parsed is not None:
+                return parsed
+
+    full_text = card.inner_text()
+    for pattern in regex_patterns:
+        match = re.search(pattern, full_text, re.IGNORECASE)
+        if match:
+            try:
+                value = float(match.group(1).replace(",", "."))
+            except ValueError:
+                continue
+            return int(value) if value.is_integer() else int(value)
+
+    numeric_candidates = [text for text in candidate_texts if _parse_int(text) is not None]
+    if len(numeric_candidates) > fallback_index:
+        return _parse_int(numeric_candidates[fallback_index])
+
+    return None
 
 
 def _scrape_moragas_agency(page: Page, cfg: Dict) -> List[Dict]:

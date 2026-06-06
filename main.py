@@ -13,6 +13,7 @@ Environment variables (see .env.example):
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -27,9 +28,10 @@ load_dotenv()
 
 from database import init_db, upsert_property, mark_inactive, get_property, get_price_history
 from telegram_bot import send_alert, format_new_property_message, format_price_drop_message
-from scraper_local import scrape_all_local
+from scraper_local import scrape_all_local, SCRAPERS as LOCAL_SCRAPERS
 from scraper_apify import scrape_idealista
 from run_idealista_headful import scrape_idealista_properties
+from run_yaencontre_headful import scrape_yaencontre_properties
 from matching import best_similarity_match
 from similarity_config import FAVORITE_PROFILES, MIN_SIMILARITY_SCORE, ALERT_LOCATION_TERMS
 
@@ -62,64 +64,139 @@ MIN_SIMILARITY_SCORE_ALERT: int = MIN_SIMILARITY_SCORE
 
 ENABLE_LOCAL_SCRAPER: bool = True
 ENABLE_APIFY_SCRAPER: bool = False
-ENABLE_IDEALISTA_LOCAL: bool = False
+ENABLE_IDEALISTA_LOCAL: bool = True
+
+# ---------------------------------------------------------------------------
+# Populations to scrape (for headful scrapers)
+# ---------------------------------------------------------------------------
+
+POPULATIONS: List[str] = ["sant_cugat", "sant_quirze", "cerdanyola"]
 
 
 # ---------------------------------------------------------------------------
 # Main orchestration logic
 # ---------------------------------------------------------------------------
 
-def run() -> None:
+def run(populations: List[str] | None = None) -> None:
     """
-    Full scraping pipeline:
-      1. Initialise the database.
+    Main entry point: run scraping for all configured populations.
+    """
+    populations_to_run = populations or POPULATIONS
+
+    logger.info("=" * 80)
+    logger.info("Immo Scraper MULTI-POPULATION run started.")
+    logger.info("=" * 80)
+
+    all_results = []
+
+    for population in populations_to_run:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info(f"Processing population: {population.upper()}")
+        logger.info("=" * 80)
+        
+        result = run_for_population(population)
+        all_results.append((population, result))
+
+    # ---- Final summary ----
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("FINAL SUMMARY - All Populations")
+    logger.info("=" * 80)
+    for population, result in all_results:
+        logger.info(
+            f"{population.upper():20s} | New: {result['new_count']:3d} | "
+            f"Price drops: {result['price_drop_count']:3d} | "
+            f"Alerts: {result['alerts_sent']:3d}"
+        )
+    logger.info("=" * 80)
+
+
+def run_for_population(population: str) -> Dict:
+    """
+    Full scraping pipeline for a specific population:
+      1. Initialize the population-specific database.
       2. Fetch properties from all configured sources.
       3. Upsert each property; detect new listings and price drops.
       4. Mark unseen properties as inactive.
       5. Send Telegram alerts for relevant events.
+      
+    Args:
+        population: Population key (e.g., "sant_cugat", "sant_quirze", "cerdanyola")
+    
+    Returns:
+        Dictionary with summary statistics.
     """
-    logger.info("=" * 60)
-    logger.info("Immo Scraper run started.")
-    logger.info("=" * 60)
-
-    # ---- Step 1: Database ----
-    init_db()
+    # ---- Step 1: Database (population-specific) ----
+    init_db(population=population)
 
     # ---- Step 2: Collect raw data ----
     raw_properties: List[Dict] = []
+    skip_sources: set[str] = set()
 
     if ENABLE_LOCAL_SCRAPER:
-        logger.info("Running local (Playwright) scrapers …")
-        try:
-            local_props = scrape_all_local()
-            logger.info("Local scrapers returned %d properties.", len(local_props))
-            raw_properties.extend(local_props)
-        except Exception as exc:
-            logger.error("Local scrapers failed: %s", exc, exc_info=True)
+        if population == "sant_cugat":
+            # For Sant Cugat, use local scrapers (agencies)
+            logger.info("Running local (Playwright) scrapers …")
+            try:
+                local_result = scrape_all_local(return_metadata=True, exclude_sources=["yaencontre"])
+                local_props, local_meta = local_result
+                logger.info("Local scrapers returned %d properties.", len(local_props))
+                raw_properties.extend(local_props)
+                skip_sources.update(local_meta.get("failed_sources", []))
+            except Exception as exc:
+                logger.error("Local scrapers failed: %s", exc, exc_info=True)
+                skip_sources.update(cfg["source"] for cfg in LOCAL_SCRAPERS)
 
-    if ENABLE_APIFY_SCRAPER:
+        # Run Yaencontre via the headful runner to allow manual verification
+        try:
+            logger.info(f"Running headful Yaencontre runner for {population}…")
+            yaen_props = scrape_yaencontre_properties(population)
+            logger.info("Yaencontre runner returned %d properties.", len(yaen_props))
+            if yaen_props:
+                raw_properties.extend(yaen_props)
+            else:
+                skip_sources.add("yaencontre")
+        except Exception as exc:
+            logger.error("Yaencontre headful runner failed: %s", exc, exc_info=True)
+            skip_sources.add("yaencontre")
+
+    if ENABLE_APIFY_SCRAPER and population == "sant_cugat":
         logger.info("Running Apify (Idealista) scraper …")
         try:
             apify_props = scrape_idealista()
             logger.info("Apify scraper returned %d properties.", len(apify_props))
-            raw_properties.extend(apify_props)
+            if apify_props:
+                raw_properties.extend(apify_props)
+            else:
+                skip_sources.add("idealista")
         except Exception as exc:
             logger.error("Apify scraper failed: %s", exc, exc_info=True)
+            skip_sources.add("idealista")
 
     if ENABLE_IDEALISTA_LOCAL:
-        logger.info("Running local headful Idealista scraper …")
+        logger.info(f"Running local headful Idealista scraper for {population}…")
         try:
-            idealista_local_props = scrape_idealista_properties()
+            idealista_local_props = scrape_idealista_properties(population)
             logger.info("Local Idealista scraper returned %d properties.", len(idealista_local_props))
-            raw_properties.extend(idealista_local_props)
+            if idealista_local_props:
+                raw_properties.extend(idealista_local_props)
+            else:
+                skip_sources.add("idealista_local")
         except Exception as exc:
             logger.error("Local Idealista scraper failed: %s", exc, exc_info=True)
+            skip_sources.add("idealista_local")
 
-    logger.info("Total properties fetched this run: %d", len(raw_properties))
+    logger.info("Total properties fetched for %s this run: %d", population, len(raw_properties))
 
     if not raw_properties:
-        logger.warning("No properties retrieved. Exiting without updating the database.")
-        return
+        logger.warning("No properties retrieved for %s. Exiting without updating the database.", population)
+        return {
+            "population": population,
+            "new_count": 0,
+            "price_drop_count": 0,
+            "alerts_sent": 0,
+        }
 
     # ---- Step 3: Upsert & detect events ----
     seen_ids: List[str] = []
@@ -151,8 +228,14 @@ def run() -> None:
                 price_drops.append((prop, old_price))
 
     # ---- Step 4: Mark unseen as inactive ----
-    inactive_count = mark_inactive(seen_ids)
-    logger.info("Properties marked inactive this run: %d", inactive_count)
+    if skip_sources:
+        logger.warning(
+            "Skipping inactive-marking for unreliable sources this run: %s",
+            ", ".join(sorted(skip_sources)),
+        )
+
+    inactive_count = mark_inactive(seen_ids, skip_sources=sorted(skip_sources))
+    logger.info("Properties marked inactive this run for %s: %d", population, inactive_count)
 
     # ---- Step 5: Compute market averages with Pandas ----
     df = pd.DataFrame(raw_properties)
@@ -160,7 +243,8 @@ def run() -> None:
         avg_price = df["price"].dropna().mean()
         median_price = df["price"].dropna().median()
         logger.info(
-            "Market snapshot – avg price: %.0f €  |  median price: %.0f €",
+            "Market snapshot for %s – avg price: %.0f €  |  median price: %.0f €",
+            population,
             avg_price,
             median_price,
         )
@@ -184,12 +268,32 @@ def run() -> None:
                 alerts_sent += 1
 
     logger.info(
-        "Run complete. New: %d | Price drops: %d | Alerts sent: %d",
+        "Run complete for %s. New: %d | Price drops: %d | Alerts sent: %d",
+        population,
         len(new_properties),
         len(price_drops),
         alerts_sent,
     )
-    logger.info("=" * 60)
+    
+    if new_properties:
+        logger.info(f"New listings detected for {population}:")
+        for prop in new_properties:
+            logger.info(
+                "  + %s | %s € | %s | %s",
+                prop.get("title", "Sin título"),
+                _format_price_for_log(prop.get("price")),
+                prop.get("source", "unknown"),
+                prop.get("url", ""),
+            )
+    else:
+        logger.info(f"New listings detected for {population}: 0")
+
+    return {
+        "population": population,
+        "new_count": len(new_properties),
+        "price_drop_count": len(price_drops),
+        "alerts_sent": alerts_sent,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -288,9 +392,37 @@ def _normalize_text(text: str) -> str:
     return " ".join(normalized.lower().split())
 
 
+def _format_price_for_log(value: object) -> str:
+    if value is None:
+        return "?"
+
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if numeric_value.is_integer():
+        return f"{int(numeric_value):,}"
+
+    return f"{numeric_value:,.2f}".rstrip("0").rstrip(".")
+
+
 # ---------------------------------------------------------------------------
 # Entry-point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Run the Immo Scraper pipeline.")
+    parser.add_argument(
+        "population",
+        nargs="?",
+        choices=POPULATIONS + ["all"],
+        default="all",
+        help="Population to scrape, or 'all' to run every configured population.",
+    )
+    args = parser.parse_args()
+
+    if args.population == "all":
+        run()
+    else:
+        run([args.population])
