@@ -3,6 +3,7 @@
 Automated real-estate monitoring system for **Sant Cugat del Vallès** and **Cerdanyola del Vallès**.
 
 The system scrapes property listings from Idealista (via Apify or a local headful Playwright runner) and local agencies (via Playwright), stores them in a local SQLite database, tracks price history, and sends Telegram alerts when a matching opportunity appears or a price drops.
+It also stores a lightweight event log so you can analyse listing churn over time.
 
 ---
 
@@ -24,7 +25,8 @@ The system scrapes property listings from Idealista (via Apify or a local headfu
 7. [Alert criteria](#alert-criteria)
 8. [Module reference](#module-reference)
 9. [Database schema](#database-schema)
-10. [Troubleshooting](#troubleshooting)
+10. [Analysis notebooks](#analysis-notebooks)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -51,8 +53,9 @@ The system scrapes property listings from Idealista (via Apify or a local headfu
          │   (SQLite3)      │
          │  properties      │
          │  price_history   │
+         │  property_events │
          └────────┬─────────┘
-                  │  new listing / price drop
+                  │  new listing / price drop / status change
                   ▼
          ┌──────────────────┐
          │ telegram_bot.py  │
@@ -342,6 +345,8 @@ Alerts are triggered by two events:
 - **New listing**: a property ID appears in the database for the first time.
 - **Price drop**: a property's price is lower than in the previous run.
 
+The database also logs state transitions and price changes in `property_events`, which lets you detect when a listing disappears, reappears, or gets repriced later on.
+
 ---
 
 ## Module reference
@@ -349,15 +354,76 @@ Alerts are triggered by two events:
 | File | Responsibility |
 |------|---------------|
 | `main.py` | Orchestrator; runs all scrapers, upserts results, sends alerts. Entry-point for cron. |
-| `database.py` | SQLite3 helper; creates tables, upserts properties, records price history, marks inactive listings. |
+| `database.py` | SQLite3 helper; creates tables, upserts properties, records price history and state events, marks inactive listings. |
 | `telegram_bot.py` | Sends Markdown-formatted messages to a Telegram chat via the Bot API. |
 | `scraper_local.py` | Playwright headless scraper for local agency websites. Configurable per agency via `SCRAPERS`. |
 | `scraper_apify.py` | Calls an Apify actor to scrape Idealista. Normalises raw actor output to the DB schema. |
 | `matching.py` | Computes the similarity score against the configured ideal property profiles. |
 | `similarity_config.py` | User-editable list of ideal property profiles and alert threshold. |
 | `recalculate_similarity.py` | Recomputes the current similarity score for all stored properties. |
+| `analysis.py` | **Shared analysis library**: daily-panel reconstruction, cross-source dedup + multi-agency signal, re-listing detection, out-of-area/parse-artifact filtering, hedonic fair-value model, Kaplan–Meier survival, market indicators, notary closing-price baselines, affordability math and the offer calculator. Used by the report builder and the notebooks. |
+| `build_report.py` | **Generates the local website** (`reports/index.html` + one page per town): interactive charts, buyer-score verdict, asking-vs-closing gap, budget tables, sortable top-40 candidates with offer guidance. Also exports the top-100 excels. Self-contained/offline — share the `reports/` folder with anyone. |
+| `enrich_details.py` | Occasional headful run that fetches full detail-page descriptions/features for active in-band listings — **all sources**, not just Idealista (per-source selectors for the shared qgat_homes/mashomes/fincas_cano_pujol template, fincas_moragas, fincas_calvo, plus generic/meta-description fallbacks for anything else). Feeds motivated-seller keywords, orientation, street, FGC proximity. `python enrich_details.py sant_cugat --limit 40` or targeted: `--property-ids @sant_cugat_enrich_shortlist.txt`. |
+| `notariado_baselines.json` | Closing-price baselines (Portal Estadístico del Notariado) for Sant Cugat + zips 08173/08195, extracted from `PENotariado_reports/`. |
+| `budget_config.json` | **Your financial profile** (savings, extra cash if needed, saving rate, mortgage rate/term, payment caps). Edit it and re-run `build_report.py` — every affordability verdict, max-price card and per-listing payment recomputes from it. |
+| `market_analysis.ipynb` | Daily market read (set `POPULATION` at the top): inventory & flows, asking-vs-closing gap, cut breadth, months of supply, survival curve, market-timing verdict, budget reality check, leverage list. |
+| `rank_offer_candidates.ipynb` | Ranked top-100 (400–700k band, deduped) with value/leverage/affordability scores and per-listing opening/target/walk-away offers; exports `{population}_offer_candidates_400_700k.xlsx`. |
 | `requirements.txt` | Python dependencies. |
 | `.env.example` | Template for secrets – copy to `.env` and fill in. |
+
+> **Deprecated / removal candidates** (superseded by `analysis.py` + `build_report.py` +
+> the two parametrized notebooks; delete when comfortable):
+> the six `inspect_*`/`rank_*_500_600k` notebooks, the three `*_offer_candidates_500_600k.xlsx`
+> excels, `notebook_exports/` (stale CSV dumps), `debug_pagination.py` (one-off dev script),
+> `smoke_local_scraper.db` + `inspect_smoke_local_scraper_db.ipynb` (old smoke artifacts;
+> keep `tests/smoke_local_scraper.py`, still useful when adding agencies), and
+> `scraper_apify.py` (Apify path disabled since the local Idealista scraper works — removing
+> it also means dropping its import and the `ENABLE_APIFY_SCRAPER` block in `main.py`).
+> Telegram and cron setup are intentionally left as-is for now.
+
+### Daily / weekly routine (current flow)
+
+```bash
+# DAILY — data + report:
+python main.py             # scrape all towns (headful steps as usual)
+python build_report.py     # rebuild reports/ (the local website) + the 3 top-100 excels
+open reports/index.html    # browse; share the reports/ folder with your partner
+
+# WEEKLY (recommended, per town):
+python enrich_details.py sant_cugat --limit 40
+# fetches full descriptions ONLY for active in-band listings that still lack
+# one (incremental + rate-limited), so motivated-seller keywords get real text.
+
+# WHEN YOUR FINANCES CHANGE (more savings, real bank offer, better rate):
+#   edit budget_config.json -> re-run build_report.py; every affordability
+#   verdict, months-to-feasible and per-listing offer recomputes.
+
+# EVERY FEW MONTHS: re-download the PENotariado PDFs into PENotariado_reports/
+#   and refresh notariado_baselines.json so closing-price anchors stay current.
+
+# OCCASIONAL deep dives: market_analysis.ipynb / rank_offer_candidates.ipynb
+#   (same analysis.py library; set POPULATION at the top)
+```
+
+The report answers, per town: is it a good month to buy (buyer score + signals,
+low-history metrics shown ⚪ and excluded), asking vs notary closing gap, market
+speed (survival curve), your budget scenarios (80%/90% LTV, months of saving —
+computed by lowering effective LTV until the cuota fits — and the cheapest path
+to unlock each price), and a deduped top-40 with a 4-tier offer ladder
+(aggressive / target / prudent / walk-away) plus per-listing affordability at
+both the asking price and the target offer.
+
+### Analysis pipeline notes
+
+- **Grace period for delistings**: a listing must be missing for 2 consecutive runs
+  (`database.GRACE_MISSED_RUNS`) before being marked inactive; the `runs` table records every
+  scraper execution so analyses can tell "source failed" from "listing gone". `last_seen` now
+  always reflects the last *real* sighting.
+- **All scraped prices are asking prices.** Closing baselines come from the notary reports;
+  refresh them by re-downloading the PDFs into `PENotariado_reports/` and updating
+  `notariado_baselines.json`.
+- Run `enrich_details.py` weekly per town so keyword flags (herencia/urge/reformar/negociable…)
+  have full descriptions to scan.
 
 ---
 
@@ -413,7 +479,31 @@ The SQLite database is stored in `immo_scraper.db` next to `main.py`.
 A row is appended every time a price change is detected, including the initial insertion.
 Use this table to plot price evolution over time.
 
+### `property_events`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | Auto-increment |
+| `property_id` | TEXT | FK → `properties.property_id` |
+| `event_type` | TEXT | `inserted`, `reactivated`, `inactive`, `price_change` |
+| `event_date` | TEXT | ISO-8601 UTC datetime |
+| `source` | TEXT | Scraper source that emitted the event |
+| `old_status` | TEXT | Previous listing status, if applicable |
+| `new_status` | TEXT | New listing status, if applicable |
+| `old_price` | REAL | Previous price, if applicable |
+| `new_price` | REAL | New price, if applicable |
+
+Use this table to reconstruct the full lifecycle of a listing and to derive negotiation signals such as prior appearances, reactivations, and price drops.
+
 ---
+
+## Analysis notebooks
+
+The repository includes notebook-based analysis workflows for inspection and ranking.
+
+- `inspect_local_scraper_visualization.ipynb` shows daily listings, exits, and reactivations, and it now picks a default property with richer history when no `selected_property_id` is set.
+- `rank_sant_cugat_offer_candidates_500_600k.ipynb` ranks Sant Cugat candidates with a reactivation-aware score and exports `reactivation_events` plus `final_score_reactivated` to the Excel workbook.
+- The Cerdanyola and Sant Quirze ranking notebooks follow the same export pattern, so their generated Excel files stay aligned with the Sant Cugat version.
 
 ## Troubleshooting
 

@@ -1,0 +1,28 @@
+{
+  "_help": {
+    "savings": "Cash disponible HOY para entrada + gastos (€)",
+    "extra_cash_if_needed": "Cash adicional al que podríais llegar si hiciera falta (p.ej. liquidar + donación padres) (€)",
+    "monthly_savings": "Ritmo de ahorro mensual (€/mes) — se usa para calcular 'factible en N meses'",
+    "monthly_net_income": "Ingresos netos mensuales conjuntos (€)",
+    "annual_rate_pct": "Tipo hipotecario anual estimado (%)",
+    "term_years": "Plazo hipoteca (años)",
+    "comfortable_payment": "Cuota mensual cómoda (€)",
+    "max_payment": "Cuota mensual máxima aceptable (€)",
+    "stretch_payment": "Cuota solo para una oportunidad excepcional (€)",
+    "itp_rate": "ITP Cataluña segunda mano (0.10 = 10%)",
+    "fees_rate": "Notaría + registro + gestoría + tasación (~1.5%)",
+    "max_ltv": "LTV máximo estándar del banco (0.80 = 80%)"
+  },
+  "savings": 160000,
+  "extra_cash_if_needed": 30000,
+  "monthly_savings": 3300,
+  "monthly_net_income": 6500,
+  "annual_rate_pct": 2.0,
+  "term_years": 30,
+  "comfortable_payment": 1500,
+  "max_payment": 1700,
+  "stretch_payment": 1800,
+  "itp_rate": 0.10,
+  "fees_rate": 0.015,
+  "max_ltv": 0.80
+}

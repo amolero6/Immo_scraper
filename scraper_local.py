@@ -175,19 +175,20 @@ SCRAPERS: List[Dict] = [
         "source": "qgat_homes",
         "base_url": "https://www.qgathomes.com/ca/venda/a-barcelona-sant_cugat_del_valles",
         "city": "Sant Cugat del Vallès",
-        # Qgat listing card and field selectors.
-        "listing_selector": "div.DLFichaParent",
-        "title_selector": ".DLFichaTitulo a[href*='/ref-']",
-        "price_selector": ".DLFichaPrecio .DLFichaPrecioVenta",
-        "link_selector": ".DLFichaTitulo a[href*='/ref-']",
-        "rooms_selector": ".iconos i.fa-bed",
-        "bathrooms_selector": ".iconos i.fa-bath",
-        "sqm_selector": ".iconos i.glyphicons-fit-frame-to-image span",
+        # Qgat's current portal groups each listing inside a `div.ficha` card.
+        # Title, price and metrics now live in semantically named sub-blocks.
+        "listing_selector": "div.ficha",
+        "title_selector": ".ficha_titulo a[href*='/ref-']",
+        "price_selector": ".ficha_precio_venta",
+        "link_selector": ".ficha_titulo a[href*='/ref-']",
+        "rooms_selector": ".bloqueDormitorios .dormitoriosValor",
+        "bathrooms_selector": ".bloqueBanos .banosValor",
+        "sqm_selector": ".bloqueSuperficie .superficieValor",
         "pool_keyword": "piscina",                            # case-insensitive
         "ac_keyword": "aire condicionat",                     # case-insensitive
         # Pagination is hash-based (#page-N) on this portal.
         "pagination_mode": "hash",
-        "pagination_page_selector": "ul.pagination a[href^='#page-']",
+        "pagination_page_selector": "a.page-link[href^='#page-']",
         "max_pages": 10,
     },
     {

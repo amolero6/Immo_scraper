@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 # Load environment variables before importing project modules
 load_dotenv()
 
-from database import init_db, upsert_property, mark_inactive, get_property, get_price_history
+from database import init_db, upsert_property, mark_inactive, get_property, get_price_history, record_run
 from telegram_bot import send_alert, format_new_property_message, format_price_drop_message
 from scraper_local import scrape_all_local, SCRAPERS as LOCAL_SCRAPERS
 from scraper_apify import scrape_idealista
@@ -107,6 +107,8 @@ def run(populations: List[str] | None = None) -> None:
         logger.info(
             f"{population.upper():20s} | New: {result['new_count']:3d} | "
             f"Price drops: {result['price_drop_count']:3d} | "
+            f"Reactivations: {result['reactivation_count']:3d} | "
+            f"Salidas: {result['inactive_count']:3d} | "
             f"Alerts: {result['alerts_sent']:3d}"
         )
     logger.info("=" * 80)
@@ -144,9 +146,23 @@ def run_for_population(population: str) -> Dict:
                 logger.info("Local scrapers returned %d properties.", len(local_props))
                 raw_properties.extend(local_props)
                 skip_sources.update(local_meta.get("failed_sources", []))
+                local_counts: Dict[str, int] = {}
+                for prop in local_props:
+                    local_counts[prop.get("source", "unknown")] = local_counts.get(prop.get("source", "unknown"), 0) + 1
+                for cfg in LOCAL_SCRAPERS:
+                    src = cfg["source"]
+                    if src == "yaencontre":
+                        continue
+                    if src in local_meta.get("failed_sources", []):
+                        record_run(src, 0, "failed")
+                    else:
+                        record_run(src, local_counts.get(src, 0), "ok" if local_counts.get(src) else "empty")
             except Exception as exc:
                 logger.error("Local scrapers failed: %s", exc, exc_info=True)
                 skip_sources.update(cfg["source"] for cfg in LOCAL_SCRAPERS)
+                for cfg in LOCAL_SCRAPERS:
+                    if cfg["source"] != "yaencontre":
+                        record_run(cfg["source"], 0, "failed")
 
         # Run Yaencontre via the headful runner to allow manual verification
         try:
@@ -155,11 +171,14 @@ def run_for_population(population: str) -> Dict:
             logger.info("Yaencontre runner returned %d properties.", len(yaen_props))
             if yaen_props:
                 raw_properties.extend(yaen_props)
+                record_run("yaencontre", len(yaen_props), "ok")
             else:
                 skip_sources.add("yaencontre")
+                record_run("yaencontre", 0, "empty")
         except Exception as exc:
             logger.error("Yaencontre headful runner failed: %s", exc, exc_info=True)
             skip_sources.add("yaencontre")
+            record_run("yaencontre", 0, "failed")
 
     if ENABLE_APIFY_SCRAPER and population == "sant_cugat":
         logger.info("Running Apify (Idealista) scraper …")
@@ -181,11 +200,14 @@ def run_for_population(population: str) -> Dict:
             logger.info("Local Idealista scraper returned %d properties.", len(idealista_local_props))
             if idealista_local_props:
                 raw_properties.extend(idealista_local_props)
+                record_run("idealista_local", len(idealista_local_props), "ok")
             else:
                 skip_sources.add("idealista_local")
+                record_run("idealista_local", 0, "empty")
         except Exception as exc:
             logger.error("Local Idealista scraper failed: %s", exc, exc_info=True)
             skip_sources.add("idealista_local")
+            record_run("idealista_local", 0, "failed")
 
     logger.info("Total properties fetched for %s this run: %d", population, len(raw_properties))
 
@@ -195,6 +217,8 @@ def run_for_population(population: str) -> Dict:
             "population": population,
             "new_count": 0,
             "price_drop_count": 0,
+            "reactivation_count": 0,
+            "inactive_count": 0,
             "alerts_sent": 0,
         }
 
@@ -202,6 +226,7 @@ def run_for_population(population: str) -> Dict:
     seen_ids: List[str] = []
     new_properties: List[Dict] = []
     price_drops: List[tuple] = []    # (prop_dict, old_price)
+    reactivations: List[Dict] = []
 
     for prop in raw_properties:
         pid = prop.get("property_id")
@@ -222,6 +247,8 @@ def run_for_population(population: str) -> Dict:
         if action == "inserted":
             new_properties.append(prop)
         elif action == "updated" and existing:
+            if existing.get("status") == "inactive":
+                reactivations.append(prop)
             old_price = existing.get("price")
             new_price = prop.get("price")
             if old_price and new_price and new_price < old_price:
@@ -268,10 +295,12 @@ def run_for_population(population: str) -> Dict:
                 alerts_sent += 1
 
     logger.info(
-        "Run complete for %s. New: %d | Price drops: %d | Alerts sent: %d",
+        "Run complete for %s. New: %d | Price drops: %d | Reactivations: %d | Salidas: %d | Alerts sent: %d",
         population,
         len(new_properties),
         len(price_drops),
+        len(reactivations),
+        inactive_count,
         alerts_sent,
     )
     
@@ -292,6 +321,8 @@ def run_for_population(population: str) -> Dict:
         "population": population,
         "new_count": len(new_properties),
         "price_drop_count": len(price_drops),
+        "reactivation_count": len(reactivations),
+        "inactive_count": inactive_count,
         "alerts_sent": alerts_sent,
     }
 

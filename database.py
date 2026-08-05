@@ -3,9 +3,10 @@ database.py
 -----------
 SQLite database module for the Immo Scraper project.
 
-Manages two tables:
-  - properties     : one row per property (upsert on each run)
-  - price_history  : append-only log of every price change
+Manages three tables:
+    - properties      : one row per property (upsert on each run)
+    - price_history   : append-only log of every price change
+    - property_events : append-only log of listing state changes and price drops
 """
 
 import logging
@@ -62,9 +63,21 @@ CREATE TABLE IF NOT EXISTS properties (
     is_favourite INTEGER DEFAULT 0,
     similarity_score INTEGER,
     similarity_profile TEXT,
+    description  TEXT,
+    agent        TEXT,
+    missed_runs  INTEGER DEFAULT 0,
+    enriched_at  TEXT,                 -- ISO-8601 datetime the detail page was visited (NULL = never)
     first_seen   TEXT NOT NULL,       -- ISO-8601 datetime
     last_seen    TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_date          TEXT NOT NULL,   -- ISO-8601 datetime
+    source            TEXT NOT NULL,
+    listings_returned INTEGER,
+    status            TEXT NOT NULL DEFAULT 'ok'  -- 'ok' | 'failed' | 'empty'
 );
 
 CREATE TABLE IF NOT EXISTS price_history (
@@ -73,6 +86,21 @@ CREATE TABLE IF NOT EXISTS price_history (
     price       REAL NOT NULL,
     date        TEXT NOT NULL         -- ISO-8601 datetime
 );
+
+CREATE TABLE IF NOT EXISTS property_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_id TEXT NOT NULL REFERENCES properties(property_id),
+    event_type  TEXT NOT NULL,
+    event_date  TEXT NOT NULL,
+    source      TEXT,
+    old_status  TEXT,
+    new_status  TEXT,
+    old_price   REAL,
+    new_price   REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_property_events_property_date
+    ON property_events(property_id, event_date);
 """
 
 
@@ -128,6 +156,7 @@ def init_db(db_path: Optional[Path] = None, population: Optional[str] = None) ->
         _ensure_columns(conn)
         _ensure_price_first_seen(conn)
         _repair_invalid_price_first_seen(conn)
+        _backfill_enriched_at(conn)
     logger.info("Database ready.")
 
 
@@ -169,8 +198,8 @@ def upsert_property(prop: Dict) -> str:
                      property_type, operation, city, district, neighborhood,
                      postal_code, latitude, longitude, energy_rating, year_built,
                      floor, terrace, elevator, parking, is_favourite,
-                     similarity_score, similarity_profile, first_seen, last_seen,
-                     status)
+                     similarity_score, similarity_profile, description, agent,
+                     missed_runs, first_seen, last_seen, status)
                 VALUES
                     (:property_id, :source, :title, :url, :price, :rooms, :bathrooms,
                      :price_first_seen, :sqm, :has_pool, :has_ac, :orientation,
@@ -178,7 +207,7 @@ def upsert_property(prop: Dict) -> str:
                      :postal_code, :latitude, :longitude, :energy_rating,
                      :year_built, :floor, :terrace, :elevator, :parking,
                      :is_favourite, :similarity_score, :similarity_profile,
-                     :first_seen, :last_seen, 'active')
+                     :description, :agent, 0, :first_seen, :last_seen, 'active')
                 """,
                 {
                     "property_id": property_id,
@@ -210,9 +239,20 @@ def upsert_property(prop: Dict) -> str:
                     "is_favourite": int(bool(prop.get("is_favourite", False))),
                     "similarity_score": prop.get("similarity_score"),
                     "similarity_profile": prop.get("similarity_profile"),
+                    "description": prop.get("description"),
+                    "agent": prop.get("agent"),
                     "first_seen": now,
                     "last_seen": now,
                 },
+            )
+            _append_property_event(
+                conn,
+                property_id=property_id,
+                event_type="inserted",
+                event_date=now,
+                source=prop.get("source", "unknown"),
+                new_status="active",
+                new_price=new_price,
             )
             # Record the initial price in history
             if new_price is not None:
@@ -256,6 +296,12 @@ def upsert_property(prop: Dict) -> str:
                 similarity_score = :similarity_score,
                 similarity_profile = :similarity_profile,
                 price_first_seen = :price_first_seen,
+                description = CASE
+                    WHEN :description IS NOT NULL
+                         AND LENGTH(COALESCE(:description, '')) > LENGTH(COALESCE(description, ''))
+                    THEN :description ELSE description END,
+                agent       = COALESCE(:agent, agent),
+                missed_runs = 0,
                 last_seen   = :last_seen,
                 status      = 'active'
             WHERE property_id = :property_id
@@ -290,13 +336,36 @@ def upsert_property(prop: Dict) -> str:
                 "is_favourite": int(bool(prop.get("is_favourite", False))),
                 "similarity_score": prop.get("similarity_score"),
                 "similarity_profile": prop.get("similarity_profile"),
+                "description": prop.get("description"),
+                "agent": prop.get("agent"),
                 "last_seen": now,
             },
         )
 
+        if existing["status"] == "inactive":
+            _append_property_event(
+                conn,
+                property_id=property_id,
+                event_type="reactivated",
+                event_date=now,
+                source=prop.get("source", "unknown"),
+                old_status="inactive",
+                new_status="active",
+                new_price=new_price,
+            )
+
         # Record price history only when the price actually changed
         if new_price is not None and new_price != old_price:
             _append_price_history(conn, property_id, new_price, now)
+            _append_property_event(
+                conn,
+                property_id=property_id,
+                event_type="price_change",
+                event_date=now,
+                source=prop.get("source", "unknown"),
+                old_price=old_price,
+                new_price=new_price,
+            )
             logger.info(
                 "Price change detected for '%s': %s → %s",
                 property_id,
@@ -308,18 +377,29 @@ def upsert_property(prop: Dict) -> str:
         return "updated"
 
 
-def mark_inactive(active_ids: list, skip_sources: Optional[list] = None) -> int:
-    """
-    Set ``status = 'inactive'`` for every property whose ``property_id``
-    is **not** in *active_ids* and whose source is not excluded.
+GRACE_MISSED_RUNS = 2  # consecutive runs a listing must be missing before it is marked inactive
 
-    Call this at the end of each scraping run, passing the full list of IDs
-    seen in that run. If a scraper failed or returned 0 results, pass its
-    source name in ``skip_sources`` so its historical rows are not marked
-    inactive by accident.
+
+def mark_inactive(
+    active_ids: list,
+    skip_sources: Optional[list] = None,
+    grace: int = GRACE_MISSED_RUNS,
+) -> int:
+    """
+    Handle properties that were **not** seen in the current run.
+
+    Instead of flipping to inactive on a single miss (which produced lots of
+    false delistings from pagination hiccups), each unseen active property
+    gets its ``missed_runs`` counter incremented; only once it has been
+    missing for *grace* consecutive runs is it marked ``inactive``.
+    ``last_seen`` is left untouched so it always reflects the last real
+    sighting (true time-on-market).
 
     Args:
         active_ids: List of property IDs observed in the current run.
+        skip_sources: Sources whose scraper failed/under-returned this run;
+            their rows are neither incremented nor deactivated.
+        grace: Number of consecutive missed runs required to deactivate.
 
     Returns:
         Number of properties marked inactive.
@@ -332,7 +412,7 @@ def mark_inactive(active_ids: list, skip_sources: Optional[list] = None) -> int:
 
     now = _now()
     conditions = ["status = 'active'"]
-    params = [now]
+    params: list = []
 
     if active_ids:
         placeholders = ",".join("?" * len(active_ids))
@@ -344,21 +424,124 @@ def mark_inactive(active_ids: list, skip_sources: Optional[list] = None) -> int:
         conditions.append(f"source NOT IN ({source_placeholders})")
         params.extend(list(skip_sources))
 
+    where_clause = " AND ".join(conditions)
+
     with _get_conn() as conn:
+        # 1. Increment the missed-run counter for every unseen active property.
+        conn.execute(
+            f"UPDATE properties SET missed_runs = COALESCE(missed_runs, 0) + 1 WHERE {where_clause}",
+            params,
+        )
+
+        # 2. Deactivate the ones that exhausted the grace period.
+        rows = conn.execute(
+            f"""
+            SELECT property_id, source, status
+            FROM properties
+            WHERE {where_clause} AND missed_runs >= ?
+            """,
+            params + [grace],
+        ).fetchall()
+
+        for row in rows:
+            _append_property_event(
+                conn,
+                property_id=row["property_id"],
+                event_type="inactive",
+                event_date=now,
+                source=row["source"],
+                old_status=row["status"],
+                new_status="inactive",
+            )
+
         cursor = conn.execute(
             f"""
             UPDATE properties
-            SET status    = 'inactive',
-                last_seen = ?
-            WHERE {' AND '.join(conditions)}
+            SET status = 'inactive'
+            WHERE {where_clause} AND missed_runs >= ?
             """,
-            params,
+            params + [grace],
         )
         count = cursor.rowcount
 
     if count:
-        logger.info("Marked %d propert(y/ies) as inactive.", count)
+        logger.info("Marked %d propert(y/ies) as inactive (grace=%d).", count, grace)
     return count
+
+
+def record_run(source: str, listings_returned: int, status: str = "ok") -> None:
+    """Log one scraper execution so analyses can tell 'source failed' from 'listing gone'."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO runs (run_date, source, listings_returned, status) VALUES (?, ?, ?, ?)",
+            (_now(), source, listings_returned, status),
+        )
+
+
+def update_property_details(property_id: str, **fields) -> bool:
+    """
+    Update enrichment fields (description, floor, terrace, elevator, parking,
+    year_built, …) for a property without touching scraping bookkeeping.
+
+    Returns True if a row was updated.
+    """
+    allowed = {
+        "description", "agent", "floor", "terrace", "elevator", "parking",
+        "year_built", "energy_rating", "orientation", "neighborhood",
+        "postal_code", "latitude", "longitude", "property_type", "sqm",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{col} = :{col}" for col in updates)
+    updates["property_id"] = property_id
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            f"UPDATE properties SET {set_clause} WHERE property_id = :property_id",
+            updates,
+        )
+        return cursor.rowcount > 0
+
+
+def mark_enriched(property_id: str) -> None:
+    """
+    Stamp that a listing's detail page has been visited, regardless of how much
+    text we managed to extract. This is the source of truth for "already
+    enriched" — NOT description length, because some agencies genuinely have a
+    2-line description (< the old 400-char threshold), which used to make them
+    look perpetually un-enriched and get re-visited every single run.
+    """
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE properties SET enriched_at = ? WHERE property_id = ?",
+            (_now(), property_id),
+        )
+
+
+def _backfill_enriched_at(conn: sqlite3.Connection) -> None:
+    """
+    One-time migration for DBs that predate the enriched_at column. Mark as
+    enriched anything that was clearly detail-page visited before:
+      - any source with a long (>= 400 char) description, OR
+      - any NON-idealista listing with a non-empty description — the agency /
+        yaencontre listing-card scrapers never set `description`, so any text
+        there can only have come from a detail-page visit (this catches the
+        short-but-complete agency descriptions, e.g. qgat_homes' one-liner,
+        that would otherwise be re-visited forever).
+    Idealista card-snippet descriptions stay NULL (card-only, still need a
+    detail visit).
+    """
+    conn.execute(
+        """
+        UPDATE properties
+        SET enriched_at = last_seen
+        WHERE enriched_at IS NULL
+          AND (
+            LENGTH(COALESCE(description, '')) >= 400
+            OR (source NOT LIKE 'idealista%' AND LENGTH(COALESCE(description, '')) > 0)
+          )
+        """
+    )
 
 
 def get_property(property_id: str) -> Optional[Dict]:
@@ -390,6 +573,26 @@ def get_price_history(property_id: str) -> list:
     return [dict(r) for r in rows]
 
 
+def get_property_events(property_id: str) -> list:
+    """
+    Return all event-history entries for a property, oldest first.
+
+    Returns:
+        List of dicts with the event fields.
+    """
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT event_type, event_date, source, old_status, new_status, old_price, new_price
+            FROM property_events
+            WHERE property_id = ?
+            ORDER BY event_date, id
+            """,
+            (property_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -406,6 +609,37 @@ def _append_price_history(conn: sqlite3.Connection, property_id: str, price: int
     conn.execute(
         "INSERT INTO price_history (property_id, price, date) VALUES (?, ?, ?)",
         (property_id, normalized, date),
+    )
+
+
+def _append_property_event(
+    conn: sqlite3.Connection,
+    property_id: str,
+    event_type: str,
+    event_date: str,
+    source: Optional[str] = None,
+    old_status: Optional[str] = None,
+    new_status: Optional[str] = None,
+    old_price: Optional[float] = None,
+    new_price: Optional[float] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO property_events (
+            property_id, event_type, event_date, source,
+            old_status, new_status, old_price, new_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            property_id,
+            event_type,
+            event_date,
+            source,
+            old_status,
+            new_status,
+            _normalize_price(old_price),
+            _normalize_price(new_price),
+        ),
     )
 
 
@@ -469,6 +703,10 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         "is_favourite": "ALTER TABLE properties ADD COLUMN is_favourite INTEGER DEFAULT 0",
         "similarity_score": "ALTER TABLE properties ADD COLUMN similarity_score INTEGER",
         "similarity_profile": "ALTER TABLE properties ADD COLUMN similarity_profile TEXT",
+        "description": "ALTER TABLE properties ADD COLUMN description TEXT",
+        "agent": "ALTER TABLE properties ADD COLUMN agent TEXT",
+        "missed_runs": "ALTER TABLE properties ADD COLUMN missed_runs INTEGER DEFAULT 0",
+        "enriched_at": "ALTER TABLE properties ADD COLUMN enriched_at TEXT",
     }
 
     for column_name, statement in column_statements.items():

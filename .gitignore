@@ -227,3 +227,6 @@ __marimo__/
 
 #Chrome profile
 .idealista-chrome-profile/
+
+#MacOS environment files
+.DS_Store

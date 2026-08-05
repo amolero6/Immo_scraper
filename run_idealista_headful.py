@@ -335,6 +335,11 @@ def _extract_idealista_property(card, city: str) -> Dict | None:
 
         has_pool = bool(re.search(r"piscina", card_text, re.IGNORECASE))
         has_ac = bool(re.search(r"aire acondicionado|aire condicionat", card_text, re.IGNORECASE))
+        has_terrace = bool(re.search(r"terraza|terrassa", card_text, re.IGNORECASE))
+        has_elevator = bool(re.search(r"ascensor|con ascensor", card_text, re.IGNORECASE))
+        has_parking = bool(re.search(r"garaje|garatge|parking|p[aá]rking|plaza de garaje", card_text, re.IGNORECASE))
+        floor_match = re.search(r"(Planta\s+\d+[ªa]?|Bajo|Entresuelo|[ÁA]tico)", card_text, re.IGNORECASE)
+        floor = floor_match.group(1).strip() if floor_match else None
         agent_el = card.query_selector(".hightop-agent-name")
         agent = (agent_el.inner_text() or "").strip() if agent_el else None
 
@@ -360,12 +365,15 @@ def _extract_idealista_property(card, city: str) -> Dict | None:
             "longitude": None,
             "energy_rating": None,
             "year_built": None,
-            "floor": None,
-            "terrace": 0,
-            "elevator": 0,
-            "parking": 0,
+            "floor": floor,
+            "terrace": int(has_terrace),
+            "elevator": int(has_elevator),
+            "parking": int(has_parking),
             "is_favourite": 0,
             "agent": agent,
+            # card snippet: motivated-seller keywords live here (herencia,
+            # urge, a reformar, negociable, …) — kept in DB for analysis
+            "description": description[:1500] if description else None,
         }
     except Exception as exc:
         logger.warning("Could not parse Idealista card: %s", exc)
